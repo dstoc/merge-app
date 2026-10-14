@@ -232,7 +232,8 @@ impl<F> RepositoryWorkCoordinator<F> {
     /// event changed the scheduling view while GitHub was being queried.
     /// Repositories that disappeared from the listing are blocked and any
     /// coalesced work for them is retired. Repositories in the listing become
-    /// eligible again, including after a missed restoration webhook.
+    /// eligible again, including after missed restoration webhooks. A
+    /// successful listing also restores an installation blocked by suspension.
     pub fn apply_authoritative_repository_listing(
         &self,
         installation_id: u64,
@@ -249,12 +250,11 @@ impl<F> RepositoryWorkCoordinator<F> {
             .state
             .lock()
             .expect("repository coordinator lock poisoned");
-        if state.scheduling_epoch != expected_epoch
-            || state.blocked_installations.contains(&installation_id)
-        {
+        if state.scheduling_epoch != expected_epoch {
             return false;
         }
 
+        state.blocked_installations.remove(&installation_id);
         let previously_known = state
             .known_repositories
             .get(&installation_id)

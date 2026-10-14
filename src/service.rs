@@ -319,7 +319,7 @@ where
             warn!(
                 event = "installation_reconciliation_stale",
                 installation_id = installation.id,
-                reason = "lifecycle_changed_or_installation_blocked",
+                reason = "lifecycle_changed",
             );
             continue;
         }
@@ -462,6 +462,7 @@ mod tests {
         removal_requests: Mutex<Vec<u64>>,
         token_requests: Mutex<Vec<u64>>,
         repository_requests: Mutex<Vec<u64>>,
+        on_repository_listing: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     }
 
     impl InstallationDiscovery for FakeDiscovery {
@@ -490,6 +491,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(credentials.installation_id);
+            if let Some(on_repository_listing) = &self.on_repository_listing {
+                on_repository_listing(credentials.installation_id);
+            }
             if self
                 .failing_repository_installs
                 .contains(&credentials.installation_id)
@@ -553,6 +557,7 @@ mod tests {
             removal_requests: Mutex::new(Vec::new()),
             token_requests: Mutex::new(Vec::new()),
             repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
         };
         let (marked_tx, mut marked_rx) = mpsc::unbounded_channel();
         let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
@@ -607,6 +612,7 @@ mod tests {
             removal_requests: Mutex::new(Vec::new()),
             token_requests: Mutex::new(Vec::new()),
             repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
         };
         let (scheduled_tx, mut scheduled_rx) = mpsc::unbounded_channel();
         let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
@@ -636,6 +642,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_restores_a_blocked_installation_from_successful_discovery() {
+        let discovery = FakeDiscovery {
+            installations: vec![installation(10, Some(100))],
+            repositories: HashMap::from([(10, vec![repository("Allowed", "restored")])]),
+            failing_repository_installs: HashSet::new(),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
+        };
+        let (scheduled_tx, mut scheduled_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
+            let scheduled_tx = scheduled_tx.clone();
+            async move {
+                scheduled_tx
+                    .send((repository.owner, repository.name))
+                    .unwrap();
+                Ok(())
+            }
+        });
+        coordinator.block_installation(10);
+
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), scheduled_rx.recv())
+                .await
+                .unwrap(),
+            Some(("Allowed".to_owned(), "restored".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_installation_discovery_keeps_the_installation_blocked() {
+        let discovery = FakeDiscovery {
+            installations: vec![installation(10, Some(100))],
+            repositories: HashMap::new(),
+            failing_repository_installs: HashSet::from([10]),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
+        };
+        let coordinator =
+            RepositoryWorkCoordinator::new(|_repository: RepositoryLocator| async { Ok(()) });
+        coordinator.block_installation(10);
+
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            0
+        );
+        let repository = RepositoryLocator::new(10, "Allowed", "restored").unwrap();
+        assert!(
+            !coordinator
+                .mark_dirty_at_epoch(repository, coordinator.scheduling_epoch())
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_installation_discovery_keeps_the_installation_blocked() {
+        let (scheduled_tx, mut scheduled_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
+            let scheduled_tx = scheduled_tx.clone();
+            async move {
+                scheduled_tx.send(repository.name).unwrap();
+                Ok(())
+            }
+        });
+        let lifecycle_coordinator = coordinator.clone();
+        let discovery = FakeDiscovery {
+            installations: vec![installation(10, Some(100))],
+            repositories: HashMap::from([(10, vec![repository("Allowed", "restored")])]),
+            failing_repository_installs: HashSet::new(),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: Some(Arc::new(move |installation_id| {
+                lifecycle_coordinator.block_installation(installation_id);
+            })),
+        };
+
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            0
+        );
+        let repository = RepositoryLocator::new(10, "Allowed", "restored").unwrap();
+        assert!(
+            !coordinator
+                .mark_dirty_at_epoch(repository, coordinator.scheduling_epoch())
+                .unwrap()
+        );
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn reconciliation_retries_unallowlisted_installation_removal_on_the_next_pass() {
         let discovery = FakeDiscovery {
             installations: vec![installation(20, Some(200))],
@@ -645,6 +758,7 @@ mod tests {
             removal_requests: Mutex::new(Vec::new()),
             token_requests: Mutex::new(Vec::new()),
             repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
         };
         let coordinator =
             RepositoryWorkCoordinator::new(|_repository: RepositoryLocator| async { Ok(()) });
