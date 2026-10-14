@@ -148,7 +148,9 @@ A repository is managed when:
 
 No repository-side configuration file is required initially.
 
-Repositories are expected to configure GitHub native auto-merge and branch/ruleset protection appropriately, including required CI and review policy.
+Repositories are expected to configure GitHub native auto-merge and branch/ruleset protection appropriately, including required CI and review policy. Each managed base branch must require strict required checks: the branch must be up to date before GitHub can merge a pull request. In classic branch protection, enable “Require branches to be up to date before merging.” Configure the equivalent requirement in rulesets.
+
+This keeps a pull request behind the base branch blocked in GitHub while the worker rebases it. GitHub then waits for required checks on the updated branch before native auto-merge can proceed.
 
 ## Pull request eligibility
 
@@ -447,17 +449,24 @@ Install the App on one repository while retaining the existing Action as a manua
 
 Do not allow both systems to automatically rebase the same repository concurrently.
 
-Verify event transitions, permission boundaries, restart recovery, and failure cases.
+Verify event transitions, permission boundaries, restart recovery, and failure cases. Include this strict-check case:
+
+1. Enable strict required checks on the managed base branch.
+2. Make two eligible pull requests against the same base and enable auto-merge on both.
+3. Merge the first pull request.
+4. Confirm the second pull request stays blocked while its branch is behind.
+5. Confirm the worker rebases the second pull request and GitHub waits for required checks on the updated branch before auto-merging it.
 
 ### Phase 5 — Repository migration
 
 For each repository:
 
 1. install the GitHub App and grant repository access;
-2. verify reconciliation sees the repository;
-3. disable/remove the `merge-action` caller workflow;
-4. remove `PR_GH_TOKEN`;
-5. retain existing branch/ruleset protection and GitHub auto-merge settings.
+2. require strict required checks on each managed base branch, using the branch protection or ruleset setting that requires branches to be up to date before merging;
+3. verify reconciliation sees the repository;
+4. disable/remove the `merge-action` caller workflow;
+5. remove `PR_GH_TOKEN`;
+6. retain the existing branch/ruleset protection and GitHub auto-merge settings, including required CI and review policy.
 
 ## Future extensions
 
