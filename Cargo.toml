@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+humantime = "2.4.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.3", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
