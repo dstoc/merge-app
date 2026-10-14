@@ -268,21 +268,24 @@ struct InstallationEvent {
 
 #[derive(Deserialize)]
 struct RepositoryEvent {
-    installation: InstallationPayload,
+    installation: RepositoryInstallationPayload,
     repository: RepositoryPayload,
 }
 
 #[derive(Deserialize)]
 struct InstallationRepositoriesEvent {
     installation: InstallationPayload,
-    #[serde(default)]
-    repositories_added: Vec<RepositoryPayload>,
 }
 
 #[derive(Deserialize)]
 struct InstallationPayload {
     id: u64,
     account: InstallationAccountPayload,
+}
+
+#[derive(Deserialize)]
+struct RepositoryInstallationPayload {
+    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +301,7 @@ struct RepositoryPayload {
 
 #[derive(Deserialize)]
 struct RepositoryOwnerPayload {
+    id: u64,
     login: String,
 }
 
@@ -309,7 +313,12 @@ fn decode_action(
     match event_type {
         "pull_request" | "pull_request_review" => {
             let event: RepositoryEvent = serde_json::from_value(payload)?;
-            if allowed_accounts.contains(&event.installation.account.id) {
+            if event.installation.id == 0 || event.repository.owner.id == 0 {
+                return Err(serde_json::Error::custom(
+                    "installation and repository owner IDs must be positive",
+                ));
+            }
+            if allowed_accounts.contains(&event.repository.owner.id) {
                 Ok(EventAction::Repositories(vec![repository_locator(
                     event.installation.id,
                     event.repository,
@@ -328,11 +337,10 @@ fn decode_action(
             if !allowed_accounts.contains(&event.installation.account.id) {
                 return Ok(EventAction::Ignore);
             }
-            let mut repositories = Vec::with_capacity(event.repositories_added.len());
-            for repository in event.repositories_added {
-                repositories.push(repository_locator(event.installation.id, repository)?);
-            }
-            Ok(EventAction::Repositories(repositories))
+            // GitHub uses abbreviated repository objects for this event. A
+            // reconciliation reads the authoritative repository list and also
+            // handles removals, so do not decode those objects as full repos.
+            Ok(EventAction::Reconcile)
         }
         "installation" => {
             let event: InstallationEvent = serde_json::from_value(payload)?;
@@ -371,7 +379,7 @@ mod tests {
     use super::*;
 
     const TEST_SECRET: &[u8] = b"webhook test secret";
-    const REPOSITORY_PAYLOAD: &str = r#"{"installation":{"id":17,"account":{"id":1}},"repository":{"name":"merge-app","owner":{"login":"dstoc"}}}"#;
+    const REPOSITORY_PAYLOAD: &str = r#"{"action":"opened","installation":{"id":17,"node_id":"I_kgDOExample"},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}}}"#;
 
     fn test_state() -> (
         Arc<WebhookState>,
@@ -429,6 +437,49 @@ mod tests {
         assert_eq!(repository.owner, "dstoc");
         assert_eq!(repository.name, "merge-app");
         assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pull_request_review_with_simple_installation_schedules_repository() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(signed_request(
+                "pull_request_review",
+                "delivery-review",
+                REPOSITORY_PAYLOAD.as_bytes(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let repository = scheduled_rx.try_recv().unwrap();
+        assert_eq!(repository.installation_id, 17);
+        assert_eq!(repository.owner, "dstoc");
+        assert_eq!(repository.name, "merge-app");
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn installation_repositories_event_with_abbreviated_repositories_reconciles() {
+        let reconcile = Arc::new(Notify::new());
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::clone(&reconcile),
+        ));
+        let app = router(state);
+        let body = br#"{"action":"added","installation":{"id":17,"account":{"id":1}},"repositories_added":[{"id":99,"name":"merge-app","full_name":"dstoc/merge-app"}]}"#;
+        let request = signed_request("installation_repositories", "delivery-repositories", body);
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
+            .await
+            .expect("installation repositories event should wake reconciliation");
     }
 
     #[tokio::test]
