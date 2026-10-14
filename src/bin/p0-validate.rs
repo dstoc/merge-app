@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use merge_app::{
-    auth::{GitHubAppAuthenticator, InstallationCredentials},
+    auth::{GitHubAppAuthenticator, InstallationCredentials, validate_worker_permissions},
     github::{
         GitHubQueries, MergeStateStatus, Mergeability, PullRequestState, PullRequestStatus,
         RepositoryLocator, ReviewDecision,
@@ -60,7 +60,7 @@ async fn run() -> Result<()> {
     let client = authenticator.http_client();
 
     let app = authenticator.verify_app().await?;
-    validate_permissions(&app.permissions, "GitHub App")?;
+    validate_worker_permissions(&app.permissions, "GitHub App").map_err(anyhow::Error::msg)?;
 
     let installation_id = authenticator
         .repository_installation(&args.owner, &args.repo)
@@ -71,7 +71,8 @@ async fn run() -> Result<()> {
     let installation_token = authenticator
         .installation_token(installation_id, &args.owner, &args.repo)
         .await?;
-    validate_permissions(&installation_token.permissions, "installation token")?;
+    validate_worker_permissions(&installation_token.permissions, "installation token")
+        .map_err(anyhow::Error::msg)?;
 
     let queries = GitHubQueries::new(client.clone());
     let repository = RepositoryLocator::new(
@@ -383,43 +384,28 @@ fn validate_rebase_target(pull_request: &PullRequestState) -> Result<()> {
 }
 
 fn is_expected_head_mismatch(errors: &[String]) -> bool {
-    let message = errors.join(" ").to_ascii_lowercase();
     !errors.is_empty()
-        && message.contains("expected")
-        && (message.contains("head") || message.contains("oid"))
+        && errors
+            .iter()
+            .all(|error| is_expected_head_mismatch_message(error))
 }
 
-fn validate_permissions(permissions: &BTreeMap<String, String>, source: &str) -> Result<()> {
-    ensure!(
-        permissions.get("pull_requests").map(String::as_str) == Some("write"),
-        "{source} must have Pull requests: write; received permissions: {}",
-        format_permissions(permissions)
-    );
-    let unexpected = permissions
-        .iter()
-        .filter(|(name, access)| {
-            !(name.as_str() == "metadata" && access.as_str() == "read")
-                && !(name.as_str() == "pull_requests" && access.as_str() == "write")
-        })
-        .map(|(name, access)| format!("{name}: {access}"))
-        .collect::<Vec<_>>();
-    ensure!(
-        unexpected.is_empty(),
-        "{source} has permissions outside Metadata: read and Pull requests: write: {}",
-        unexpected.join(", ")
-    );
-    Ok(())
-}
+fn is_expected_head_mismatch_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let describes_expected_head =
+        message.contains("expected") && (message.contains("head") || message.contains("oid"));
+    let describes_mismatch = [
+        "does not match",
+        "doesn't match",
+        "did not match",
+        "didn't match",
+        "mismatch",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
 
-fn format_permissions(permissions: &BTreeMap<String, String>) -> String {
-    if permissions.is_empty() {
-        return "none".to_owned();
-    }
-    permissions
-        .iter()
-        .map(|(name, access)| format!("{name}: {access}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    (describes_expected_head && describes_mismatch)
+        || message.contains("head sha didn't match the current head ref")
 }
 
 fn print_evidence(evidence: &Value) -> Result<()> {
@@ -555,23 +541,27 @@ mod tests {
     }
 
     #[test]
-    fn permission_check_allows_only_implicit_metadata_and_pull_request_write() {
+    fn permission_check_allows_the_required_rebase_permissions() {
         let permissions = BTreeMap::from([
             ("metadata".to_owned(), "read".to_owned()),
-            ("pull_requests".to_owned(), "write".to_owned()),
-        ]);
-
-        assert!(validate_permissions(&permissions, "test token").is_ok());
-    }
-
-    #[test]
-    fn permission_check_rejects_contents_write_and_extra_permissions() {
-        let permissions = BTreeMap::from([
             ("contents".to_owned(), "write".to_owned()),
             ("pull_requests".to_owned(), "write".to_owned()),
         ]);
 
-        assert!(validate_permissions(&permissions, "test App").is_err());
+        assert!(validate_worker_permissions(&permissions, "test token").is_ok());
+    }
+
+    #[test]
+    fn permission_check_rejects_missing_contents_and_extra_permissions() {
+        let permissions = BTreeMap::from([("pull_requests".to_owned(), "write".to_owned())]);
+
+        assert!(validate_worker_permissions(&permissions, "test App").is_err());
+        let permissions = BTreeMap::from([
+            ("contents".to_owned(), "write".to_owned()),
+            ("pull_requests".to_owned(), "write".to_owned()),
+            ("administration".to_owned(), "write".to_owned()),
+        ]);
+        assert!(validate_worker_permissions(&permissions, "test App").is_err());
     }
 
     #[test]
@@ -579,8 +569,15 @@ mod tests {
         assert!(is_expected_head_mismatch(&[
             "The expected head OID does not match the current pull request head".to_owned()
         ]));
+        assert!(is_expected_head_mismatch(&[
+            "head sha didn't match the current head ref.".to_owned()
+        ]));
         assert!(!is_expected_head_mismatch(&[
             "Pull request is not behind its base branch".to_owned()
+        ]));
+        assert!(!is_expected_head_mismatch(&[
+            "head sha didn't match the current head ref.".to_owned(),
+            "Resource not accessible by integration".to_owned(),
         ]));
     }
 

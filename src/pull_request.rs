@@ -174,11 +174,9 @@ fn expected_outcome(messages: &[String]) -> Option<RebaseOutcome> {
     let classifications = messages
         .iter()
         .map(|message| {
-            let message = message.to_ascii_lowercase();
-            if message.contains("expected") && (message.contains("head") || message.contains("oid"))
-            {
+            if is_stale_head_message(message) {
                 Some(ExpectedFailure::StaleHead)
-            } else if message.contains("conflict") {
+            } else if message.to_ascii_lowercase().contains("conflict") {
                 Some(ExpectedFailure::Conflict)
             } else {
                 None
@@ -204,6 +202,24 @@ fn expected_outcome(messages: &[String]) -> Option<RebaseOutcome> {
         }
         _ => None,
     }
+}
+
+fn is_stale_head_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let describes_expected_head =
+        message.contains("expected") && (message.contains("head") || message.contains("oid"));
+    let describes_mismatch = [
+        "does not match",
+        "doesn't match",
+        "did not match",
+        "didn't match",
+        "mismatch",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
+
+    (describes_expected_head && describes_mismatch)
+        || message.contains("head sha didn't match the current head ref")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -358,6 +374,44 @@ mod tests {
             "observed-head-oid"
         );
         assert_eq!(body["variables"]["input"]["pullRequestId"], "PR_kwDO123");
+    }
+
+    #[tokio::test]
+    async fn recognizes_github_head_sha_mismatch_wording() {
+        let (url, _) = mock_server(
+            "200 OK",
+            r#"{"data":{"updatePullRequestBranch":null},"errors":[{"message":"head sha didn't match the current head ref."}]}"#,
+        );
+        let result = rebase_pull_request_at(
+            &Client::new(),
+            &url,
+            "installation-token",
+            "PR_kwDO123",
+            "observed-head-oid",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, RebaseOutcome::StaleHead { .. }));
+    }
+
+    #[tokio::test]
+    async fn mixed_stale_head_and_unrelated_errors_remain_unexpected() {
+        let (url, _) = mock_server(
+            "200 OK",
+            r#"{"data":{"updatePullRequestBranch":null},"errors":[{"message":"head sha didn't match the current head ref."},{"message":"Resource not accessible by integration"}]}"#,
+        );
+        let error = rebase_pull_request_at(
+            &Client::new(),
+            &url,
+            "installation-token",
+            "PR_kwDO123",
+            "observed-head-oid",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, RebaseError::GitHub(_)));
     }
 
     #[tokio::test]

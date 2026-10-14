@@ -108,6 +108,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
         config.private_key.as_pem().as_bytes(),
     )?);
     let app = authenticator.verify_app().await?;
+    crate::auth::validate_worker_permissions(&app.permissions, "GitHub App")
+        .map_err(anyhow::Error::msg)?;
     info!(event = "github_app_authenticated", app_id = app.id, app_name = %app.name);
 
     let queries = crate::github::GitHubQueries::new(authenticator.http_client());

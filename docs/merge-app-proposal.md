@@ -117,27 +117,27 @@ The target permission set is:
 | Permission | Access |
 | --- | --- |
 | Repository metadata | Read (implicit) |
+| Contents | Read/write |
 | Pull requests | Read/write |
 
-The App should not request Administration, Actions, or general Contents write permission unless an integration test proves one of them is required.
+GitHub requires both Contents: write and Pull requests: write for the
+`updatePullRequestBranch(updateMethod: REBASE)` mutation. Do not request
+Administration, Actions, or any other permission.
 
 ### Rebase API validation
 
-The current implementation uses:
+The implementation calls GitHub GraphQL's `updatePullRequestBranch` mutation
+with an expected head OID and the `REBASE` update method.
 
-```text
-gh pr update-branch <PR> --rebase
-```
+Live Phase 0 testing established that the App and repository-scoped installation
+token need Contents: write and Pull requests: write. The validator must confirm
+both permission sets before it makes pull request calls. It must also confirm
+that GitHub rejects a deliberately mismatched expected head OID without
+changing the PR, then verify a real rebase and preservation of native auto-merge.
 
-GitHub CLI implements this through the GraphQL `updatePullRequestBranch` mutation with an expected head OID and the `REBASE` update method.
-
-Before finalizing the permission model, an integration test must prove that a GitHub App installation token with only Pull Requests write can:
-
-1. call `updatePullRequestBranch(updateMethod: REBASE)` successfully;
-2. provide the expected head OID so stale observations cannot update a changed PR;
-3. preserve the pull request's existing auto-merge configuration after the rebase.
-
-If that fails, any permission expansion should be treated as an explicit design decision rather than silently granting Contents write.
+The validator recognizes GitHub's `head sha didn't match the current head ref.`
+response as the expected-head race. Mixed or unrelated GraphQL errors remain
+failures.
 
 ## Repository eligibility
 
@@ -373,7 +373,10 @@ A local health endpoint may be provided for deployers, but it is not part of the
 
 ## Security boundary
 
-The App should not have direct authority to merge a pull request or modify arbitrary repository contents.
+The App needs Contents: write because GitHub requires it for a server-side PR
+branch rebase. This permission is broader than the rebase mutation. The service
+uses it only when it calls `updatePullRequestBranch` with `REBASE`; the service
+does not call repository content write APIs or merge pull requests.
 
 The intended credential may:
 
@@ -381,16 +384,19 @@ The intended credential may:
 - update PR state within the Pull Requests permission;
 - request a server-side PR branch update/rebase.
 
-It should not have:
+The App also has Contents: write, which GitHub requires for the rebase mutation.
+The App should not have:
 
-- repository Contents write;
 - Actions write;
 - Administration permission;
 - branch-protection bypass.
 
 GitHub remains responsible for deciding whether the resulting PR satisfies the repository's rules and may merge.
 
-This retains the useful security property of `merge-action`: compromise of the queue worker should not be equivalent to unrestricted repository write access.
+The Contents permission increases the impact of a compromised queue worker.
+Keep its token repository-scoped, and keep the service's GitHub calls limited to
+the queue operations described here. GitHub still applies repository rules
+when it performs the rebase and decides whether native auto-merge can proceed.
 
 ## Migration from merge-action
 
@@ -402,7 +408,7 @@ Create a test GitHub App and prove:
 - installation-token authentication;
 - PR state queries;
 - GraphQL server-side rebase;
-- Pull Requests write without Contents write;
+- Contents write and Pull Requests write for the rebase mutation;
 - expected-head race protection;
 - preservation of native auto-merge after an App-initiated rebase.
 
