@@ -10,11 +10,9 @@ fn exits_with_a_structured_error_when_app_id_is_missing() {
         .expect("run the merge-app binary");
 
     assert!(!output.status.success());
-    let logs = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.stdout.is_empty());
+
+    let logs = String::from_utf8_lossy(&output.stderr);
     assert!(logs.contains("\"event\":\"application_failed\""));
     assert!(logs.contains("GITHUB_APP_ID is required"));
 }
