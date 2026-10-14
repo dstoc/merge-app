@@ -520,6 +520,22 @@ mod tests {
         }
     }
 
+    struct DiscoveryReconciler<'a, F> {
+        discovery: &'a FakeDiscovery,
+        allowed_accounts: &'a [u64],
+        coordinator: &'a RepositoryWorkCoordinator<F>,
+    }
+
+    impl<F, Fut> Reconciler for DiscoveryReconciler<'_, F>
+    where
+        F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        async fn reconcile(&self) -> Result<usize> {
+            reconcile_once(self.discovery, self.allowed_accounts, self.coordinator).await
+        }
+    }
+
     fn installation(id: u64, account_id: Option<u64>) -> AppInstallation {
         AppInstallation {
             id,
@@ -825,5 +841,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(reconciler.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn periodic_reconciliation_repairs_a_missed_webhook() {
+        let discovery = FakeDiscovery {
+            installations: vec![installation(10, Some(100))],
+            repositories: HashMap::from([(10, vec![repository("Allowed", "missed-event")])]),
+            failing_repository_installs: HashSet::new(),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+            on_repository_listing: None,
+        };
+        let allowed_accounts = [100];
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let shutdown = Arc::new(Mutex::new(Some(shutdown_tx)));
+        let advances = Arc::new(AtomicUsize::new(0));
+        let coordinator = RepositoryWorkCoordinator::new({
+            let advances = Arc::clone(&advances);
+            let shutdown = Arc::clone(&shutdown);
+            move |_repository: RepositoryLocator| {
+                let advances = Arc::clone(&advances);
+                let shutdown = Arc::clone(&shutdown);
+                async move {
+                    if advances.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                        shutdown.lock().unwrap().take().unwrap().send(()).unwrap();
+                    }
+                    Ok(())
+                }
+            }
+        });
+        let reconciler = DiscoveryReconciler {
+            discovery: &discovery,
+            allowed_accounts: &allowed_accounts,
+            coordinator: &coordinator,
+        };
+
+        // No webhook is sent. The startup and periodic GitHub listings must
+        // both reach the repository worker.
+        run_until(
+            1,
+            allowed_accounts.len(),
+            Duration::from_millis(10),
+            &reconciler,
+            &Notify::new(),
+            async move {
+                shutdown_rx
+                    .await
+                    .map(|()| "second repository advance")
+                    .map_err(anyhow::Error::from)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(advances.load(Ordering::SeqCst), 2);
+        assert_eq!(*discovery.repository_requests.lock().unwrap(), vec![10, 10]);
     }
 }
