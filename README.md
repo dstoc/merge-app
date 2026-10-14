@@ -91,3 +91,15 @@ final merge. Do not run mutation mode against a production PR.
 If GitHub rejects the rebase with these permissions, keep the permission set
 unchanged and save the JSON report and error for maintainer review. Do not add
 Contents: write. If auto-merge is disabled, report that result as well.
+
+## Pull request rebase API
+
+The library exposes `merge_app::pull_request::rebase_pull_request`. Pass the
+pull request's GraphQL node ID and the head OID from the current repository
+snapshot. The function sends one `updatePullRequestBranch` mutation with
+`updateMethod: REBASE` and that `expectedHeadOid`.
+
+The function returns `RebaseOutcome::StaleHead` when the head OID is stale and
+`RebaseOutcome::Conflict` when GitHub reports merge conflicts. Recompute
+repository state before taking another action after a stale-head result. Other
+GitHub and API failures return `RebaseError`.
