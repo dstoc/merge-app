@@ -415,30 +415,7 @@ fn decode_action(
     allowed_accounts: &HashSet<u64>,
 ) -> serde_json::Result<EventAction> {
     match event_type {
-        "pull_request" | "pull_request_review" => {
-            let action = payload
-                .get("action")
-                .and_then(Value::as_str)
-                .ok_or_else(|| serde_json::Error::custom("event action is missing or invalid"))?;
-            let relevant = match event_type {
-                "pull_request" => matches!(
-                    action,
-                    "opened"
-                        | "reopened"
-                        | "closed"
-                        | "synchronize"
-                        | "converted_to_draft"
-                        | "ready_for_review"
-                        | "auto_merge_enabled"
-                        | "auto_merge_disabled"
-                ),
-                "pull_request_review" => matches!(action, "submitted" | "dismissed"),
-                _ => false,
-            };
-            if !relevant {
-                return Ok(EventAction::Ignore);
-            }
-
+        "pull_request" | "pull_request_review" | "push" => {
             let event: RepositoryEvent = serde_json::from_value(payload)?;
             if event.installation.id == 0 || event.repository.owner.id == 0 {
                 return Err(serde_json::Error::custom(
@@ -565,6 +542,7 @@ mod tests {
 
     const TEST_SECRET: &[u8] = b"webhook test secret";
     const REPOSITORY_PAYLOAD: &str = r#"{"action":"opened","installation":{"id":17,"node_id":"I_kgDOExample"},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}}}"#;
+    const PUSH_PAYLOAD: &str = r#"{"installation":{"id":17,"node_id":"I_kgDOExample"},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}},"ref":"refs/heads/main","commits":[]}"#;
 
     fn test_state() -> (
         Arc<WebhookState>,
@@ -627,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relevant_pull_request_actions_schedule_the_repository() {
+    async fn known_pull_request_actions_schedule_the_repository() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
         let actions = [
@@ -665,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submitted_and_dismissed_reviews_schedule_the_repository() {
+    async fn pull_request_review_actions_schedule_the_repository() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
 
@@ -690,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_pull_request_and_review_actions_do_not_schedule_work() {
+    async fn unknown_pull_request_and_review_actions_schedule_the_repository() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
 
@@ -714,8 +692,53 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+            let repository = scheduled_rx.try_recv().unwrap();
+            assert_eq!(repository.installation_id, 17);
+            assert_eq!(repository.owner, "dstoc");
+            assert_eq!(repository.name, "merge-app");
         }
 
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_push_schedules_its_authorized_repository() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(signed_request(
+                "push",
+                "delivery-push",
+                PUSH_PAYLOAD.as_bytes(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let repository = scheduled_rx.try_recv().unwrap();
+        assert_eq!(repository.installation_id, 17);
+        assert_eq!(repository.owner, "dstoc");
+        assert_eq!(repository.name, "merge-app");
+    }
+
+    #[tokio::test]
+    async fn push_for_a_nonallowlisted_account_is_ignored() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+        let body = PUSH_PAYLOAD.replace("\"owner\":{\"id\":1", "\"owner\":{\"id\":2");
+
+        let response = app
+            .oneshot(signed_request(
+                "push",
+                "delivery-push-unlisted",
+                body.as_bytes(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(scheduled_rx.try_recv().is_err());
     }
 
@@ -777,12 +800,22 @@ mod tests {
             Some(1)
         );
 
-        let body = REPOSITORY_PAYLOAD.replace("\"opened\"", "\"synchronize\"");
         for index in 1..=64 {
+            let (event, body) = match index % 3 {
+                0 => ("push", PUSH_PAYLOAD.to_owned()),
+                1 => (
+                    "pull_request",
+                    REPOSITORY_PAYLOAD.replace("\"opened\"", "\"assigned\""),
+                ),
+                _ => (
+                    "pull_request_review",
+                    REPOSITORY_PAYLOAD.replace("\"opened\"", "\"edited\""),
+                ),
+            };
             let response = app
                 .clone()
                 .oneshot(signed_request(
-                    "pull_request",
+                    event,
                     &format!("delivery-burst-{index}"),
                     body.as_bytes(),
                 ))
@@ -920,10 +953,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_events_for_non_allowlisted_installations_are_ignored() {
+    async fn pull_request_from_a_nonallowlisted_account_is_ignored() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
-        let body = REPOSITORY_PAYLOAD.replace("\"id\":1", "\"id\":2");
+        let body = REPOSITORY_PAYLOAD.replace("\"owner\":{\"id\":1", "\"owner\":{\"id\":2");
         let request = signed_request("pull_request", "delivery-unlisted", body.as_bytes());
 
         let response = app.oneshot(request).await.unwrap();
@@ -1134,30 +1167,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_action_or_repository_identity_is_rejected_without_scheduling() {
+    async fn repository_identity_is_required_but_action_is_not() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
         let missing_action = br#"{"installation":{"id":17},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}}}"#;
         let missing_repository_identity = br#"{"action":"opened","installation":{"id":17},"repository":{"name":"merge-app","owner":{"login":"dstoc"}}}"#;
 
-        for (index, body) in [
-            missing_action.as_slice(),
-            missing_repository_identity.as_slice(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = app
-                .clone()
-                .oneshot(signed_request(
-                    "pull_request",
-                    &format!("delivery-invalid-shape-{index}"),
-                    body,
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                "pull_request",
+                "delivery-without-action",
+                missing_action,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let repository = scheduled_rx.try_recv().unwrap();
+        assert_eq!(repository.installation_id, 17);
+        assert_eq!(repository.owner, "dstoc");
+        assert_eq!(repository.name, "merge-app");
+
+        let response = app
+            .oneshot(signed_request(
+                "pull_request",
+                "delivery-without-repository-owner-id",
+                missing_repository_identity,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(scheduled_rx.try_recv().is_err());
     }
 

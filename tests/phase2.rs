@@ -31,7 +31,8 @@ use tower::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
 
 const SECRET: &[u8] = b"phase 2 integration webhook secret";
-const PULL_REQUEST_PAYLOAD: &str = r#"{"action":"opened","installation":{"id":17},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}}}"#;
+const PULL_REQUEST_PAYLOAD: &str = r#"{"action":"opened","installation":{"id":17},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}},"pull_request":{"number":999,"state":"closed","draft":true}}"#;
+const PUSH_PAYLOAD: &str = r#"{"installation":{"id":17},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}},"ref":"refs/heads/main","commits":[]}"#;
 const TEST_REPOSITORY: &str = "dstoc/merge-app";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -276,6 +277,19 @@ async fn verified_webhooks_drive_serialized_queue_work_and_lifecycle_guards() {
             )
             .unwrap()
     );
+    assert_eq!(
+        app.clone()
+            .oneshot(signed_request(
+                "push",
+                "blocked-installation-push",
+                PUSH_PAYLOAD.replace("\"id\":17", "\"id\":88").as_bytes(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(queries.calls.lock().unwrap().is_empty());
 
     // Repository removal blocks scheduling until reconciliation confirms access.
     let removed_repository = br#"{"action":"removed","installation":{"id":17,"account":{"id":1}},"repositories_removed":[{"name":"merge-app","full_name":"dstoc/merge-app"}]}"#;
@@ -296,6 +310,19 @@ async fn verified_webhooks_drive_serialized_queue_work_and_lifecycle_guards() {
             .mark_dirty_at_epoch(repository.clone(), coordinator.scheduling_epoch())
             .unwrap()
     );
+    assert_eq!(
+        app.clone()
+            .oneshot(signed_request(
+                "push",
+                "removed-repository-push",
+                PUSH_PAYLOAD.as_bytes(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(queries.calls.lock().unwrap().is_empty());
     let epoch = coordinator.scheduling_epoch();
     assert!(coordinator.apply_authoritative_repository_listing(17, &[], epoch));
     assert!(
@@ -353,15 +380,16 @@ async fn verified_webhooks_drive_serialized_queue_work_and_lifecycle_guards() {
         StatusCode::ACCEPTED
     );
     for index in 0..64 {
-        let body = if index % 2 == 0 {
-            PULL_REQUEST_PAYLOAD.replace("\"opened\"", "\"synchronize\"")
-        } else {
-            PULL_REQUEST_PAYLOAD.replace("\"opened\"", "\"submitted\"")
-        };
-        let event = if index % 2 == 0 {
-            "pull_request"
-        } else {
-            "pull_request_review"
+        let (event, body) = match index % 3 {
+            0 => ("push", PUSH_PAYLOAD.to_owned()),
+            1 => (
+                "pull_request",
+                PULL_REQUEST_PAYLOAD.replace("\"opened\"", "\"assigned\""),
+            ),
+            _ => (
+                "pull_request_review",
+                PULL_REQUEST_PAYLOAD.replace("\"opened\"", "\"edited\""),
+            ),
         };
         assert_eq!(
             app.clone()

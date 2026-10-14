@@ -39,16 +39,22 @@ through the work coordinator. Repository workers use repository-scoped
 installation tokens to run the PR queue. Failures for one installation are
 logged and do not stop reconciliation of the other allowlisted installations.
 
-Configure the GitHub App webhook subscription for `installation`,
-`installation_repositories`, `pull_request`, and `pull_request_review`. Installation
-events request an immediate reconciliation. Pull request events schedule repository
-work for `opened`, `auto_merge_enabled`, `auto_merge_disabled`, `synchronize`,
-`converted_to_draft`, `ready_for_review`, `reopened`, and `closed` actions. Review
-events schedule work for `submitted` and `dismissed` actions. Other pull request and
-review actions are acknowledged without scheduling work. Webhook payloads only
-signal that state changed; workers query GitHub for current queue state before they
-advance it. Periodic reconciliation remains the recovery path for missed webhook
-deliveries.
+Subscribe the GitHub App to these webhook events:
+
+- `installation`
+- `installation_repositories`
+- `pull_request`
+- `pull_request_review`
+- `push`
+
+Installation events request an immediate reconciliation. Every valid pull request,
+review, or push event for an authorized repository marks that repository dirty,
+regardless of the event action. These events are broad signals that repository state
+may have changed. They do not imply that the worker will mutate a pull request.
+Workers query GitHub for current queue state, including its authoritative
+`reviewDecision`, before they decide whether to advance the queue. The coordinator
+coalesces bursts for each repository. Periodic reconciliation remains the recovery
+path for missed webhook deliveries.
 
 ## Manual Phase 0 validation
 

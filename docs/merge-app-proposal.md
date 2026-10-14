@@ -169,26 +169,28 @@ Webhook events do not represent durable queue entries. They mean:
 
 > Something changed in this repository; recompute its current state.
 
-Relevant webhook subscriptions include:
+The required GitHub App webhook subscriptions are:
 
 - `installation`;
 - `installation_repositories`;
 - `pull_request`;
-- `pull_request_review`.
+- `pull_request_review`;
+- `push`.
 
-Relevant pull request changes include:
+Every valid, authorized `pull_request`, `pull_request_review`, and `push` delivery
+marks its repository dirty, regardless of action. These events are broad signals
+that repository state may have changed. They do not imply that the worker will
+mutate a pull request. A push can update a base branch directly. A pull request head
+push can also produce both `push` and `pull_request` deliveries; the repository
+coordinator coalesces the resulting work.
 
-- auto-merge enabled or disabled;
-- head synchronization;
-- draft/ready state changes;
-- reopened pull requests;
-- closed or merged pull requests.
+When the queue-head pull request merges, its `pull_request.closed` event causes the
+worker to reconsider the repository. The next eligible pull request can then
+advance.
 
-Relevant review changes include submitted and dismissed reviews.
-
-When the queue head merges, its `pull_request.closed` event causes the repository to be reconsidered and the next candidate may advance.
-
-A direct non-PR change to the base branch may not produce one of these specific events. Periodic reconciliation covers that case.
+Workers query GitHub for current queue state after a dirty signal. GitHub's
+`reviewDecision` remains authoritative; webhook payloads do not supply queue state
+or mutation instructions. Periodic reconciliation covers missed webhook deliveries.
 
 ## Queue algorithm
 
@@ -278,10 +280,12 @@ Processing should be minimal:
 
 1. Read a bounded request body.
 2. Verify `X-Hub-Signature-256` using the webhook secret.
-3. Identify the event and action.
-4. Validate the necessary payload fields.
-5. Mark the affected repository dirty or process installation lifecycle events.
-6. Return promptly.
+3. Identify the event type and validate the fields needed to identify its
+   installation and repository.
+4. For each valid pull request, review, or push delivery, mark an authorized
+   repository dirty regardless of action. Process installation lifecycle events
+   with their existing action handling.
+5. Return promptly.
 
 The application should record `X-GitHub-Delivery` and may maintain a small in-memory LRU of recent delivery IDs to suppress immediate duplicates. Correctness must not depend on deduplication.
 
