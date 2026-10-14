@@ -150,7 +150,12 @@ struct TokenCacheKey {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum TokenScope {
     AllRepositories,
-    Repository(String),
+    Repository {
+        /// The owner keeps tokens for same-named repositories in separate cache entries.
+        owner: String,
+        /// GitHub expects only this repository name in the token request.
+        name: String,
+    },
 }
 
 struct CachedToken {
@@ -460,7 +465,10 @@ impl GitHubAppAuthenticator {
 
         self.installation_token_for_scope(
             installation_id,
-            TokenScope::Repository(format!("{owner}/{repository}")),
+            TokenScope::Repository {
+                owner: owner.to_owned(),
+                name: repository.to_owned(),
+            },
         )
         .await
     }
@@ -501,8 +509,8 @@ impl GitHubAppAuthenticator {
             .header("X-GitHub-Api-Version", API_VERSION);
         request = match scope {
             TokenScope::AllRepositories => request.json(&json!({"permissions": {}})),
-            TokenScope::Repository(repository) => request.json(&json!({
-                "repositories": [repository],
+            TokenScope::Repository { name, .. } => request.json(&json!({
+                "repositories": [name],
                 "permissions": {"pull_requests": "write"}
             })),
         };
@@ -674,7 +682,10 @@ xwIDAQAB\n\
         let expires_at = now + Duration::from_secs(3600);
         let key = TokenCacheKey {
             installation_id: 12,
-            scope: TokenScope::Repository("owner/repo".to_owned()),
+            scope: TokenScope::Repository {
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            },
         };
         let mut cache = TokenCache::default();
         cache.insert(
@@ -695,7 +706,24 @@ xwIDAQAB\n\
                 .get(
                     &TokenCacheKey {
                         installation_id: 12,
-                        scope: TokenScope::Repository("owner/other".to_owned()),
+                        scope: TokenScope::Repository {
+                            owner: "owner".to_owned(),
+                            name: "other".to_owned(),
+                        },
+                    },
+                    now,
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    &TokenCacheKey {
+                        installation_id: 12,
+                        scope: TokenScope::Repository {
+                            owner: "other-owner".to_owned(),
+                            name: "repo".to_owned(),
+                        },
                     },
                     now,
                 )
@@ -840,6 +868,100 @@ xwIDAQAB\n\
         );
         assert!(requests[3].target.ends_with("page=1"));
         assert!(requests[4].target.ends_with("page=2"));
+    }
+
+    #[tokio::test]
+    async fn worker_token_uses_repository_name_and_pull_requests_write_permission() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        struct Request {
+            start_line: String,
+            headers: String,
+            body: String,
+        }
+
+        fn read_request(stream: &mut TcpStream) -> Request {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() < header_end + content_length {
+                    continue;
+                }
+
+                let start_line = headers.lines().next().unwrap().to_owned();
+                return Request {
+                    start_line,
+                    headers,
+                    body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                        .into_owned(),
+                };
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let body = r#"{"token":"worker-token","expires_at":"2030-01-01T00:00:00Z","permissions":{"pull_requests":"write"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+
+        let mut authenticator =
+            GitHubAppAuthenticator::new(1, "app-client-id", TEST_PRIVATE_KEY.as_bytes()).unwrap();
+        authenticator.api_root = format!("http://{address}");
+
+        let credentials = authenticator
+            .installation_token(7, "owner", "repo")
+            .await
+            .unwrap();
+        assert_eq!(credentials.token, "worker-token");
+
+        let request = server.join().unwrap();
+        assert_eq!(
+            request.start_line,
+            "POST /app/installations/7/access_tokens HTTP/1.1"
+        );
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer ")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+            json!({
+                "repositories": ["repo"],
+                "permissions": {"pull_requests": "write"}
+            })
+        );
     }
 
     #[test]
