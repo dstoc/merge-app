@@ -325,7 +325,7 @@ async fn run_worker<F, Fut>(
                 event = "repository_advance_failed",
                 installation_id = repository.installation_id,
                 repository = %format!("{}/{}", repository.owner, repository.name),
-                error = %work_error,
+                error = %format!("{work_error:#}"),
             );
         }
     }
