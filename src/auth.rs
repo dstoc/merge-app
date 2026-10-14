@@ -372,6 +372,44 @@ impl GitHubAppAuthenticator {
         Ok(installations)
     }
 
+    /// Uninstall this App from an account that is not on the configured
+    /// allowlist. GitHub requires an App JWT for this endpoint.
+    pub async fn uninstall_installation(
+        &self,
+        installation_id: u64,
+    ) -> Result<(), AuthenticationError> {
+        if installation_id == 0 {
+            return Err(AuthenticationError::AppAuthentication(
+                "installation ID must be greater than zero".to_owned(),
+            ));
+        }
+
+        let jwt = self.app_jwt()?;
+        let response = self
+            .client
+            .delete(format!(
+                "{}/app/installations/{installation_id}",
+                self.api_root
+            ))
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|error| {
+                AuthenticationError::AppAuthentication(format!(
+                    "installation removal request failed: {error}"
+                ))
+            })?;
+
+        if response.status() == StatusCode::ACCEPTED || response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        Err(AuthenticationError::AppAuthentication(
+            response_error(response, &jwt).await,
+        ))
+    }
+
     /// List all repositories available to an installation.
     pub async fn installation_repositories(
         &self,
@@ -868,6 +906,73 @@ xwIDAQAB\n\
         );
         assert!(requests[3].target.ends_with("page=1"));
         assert!(requests[4].target.ends_with("page=2"));
+    }
+
+    #[tokio::test]
+    async fn uninstall_uses_app_jwt_accepts_missing_installation_and_reports_api_failures() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                ("202 Accepted", ""),
+                ("404 Not Found", r#"{"message":"Not Found"}"#),
+                ("403 Forbidden", r#"{"message":"denied"}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert_ne!(read, 0, "client closed before sending request headers");
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&bytes).into_owned();
+                requests.push(request);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+
+        let mut authenticator =
+            GitHubAppAuthenticator::new(1, "app-client-id", TEST_PRIVATE_KEY.as_bytes()).unwrap();
+        authenticator.api_root = format!("http://{address}");
+
+        authenticator.uninstall_installation(17).await.unwrap();
+        authenticator.uninstall_installation(17).await.unwrap();
+        let error = authenticator.uninstall_installation(18).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 403"));
+        assert!(error.to_string().contains("denied"));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("DELETE /app/installations/17 HTTP/1.1"));
+        assert!(requests[1].starts_with("DELETE /app/installations/17 HTTP/1.1"));
+        assert!(requests[2].starts_with("DELETE /app/installations/18 HTTP/1.1"));
+        for request in requests {
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer "));
+            assert!(headers.contains("x-github-api-version: 2022-11-28"));
+        }
+        assert!(matches!(
+            authenticator.uninstall_installation(0).await,
+            Err(AuthenticationError::AppAuthentication(message))
+                if message.contains("greater than zero")
+        ));
     }
 
     #[tokio::test]
