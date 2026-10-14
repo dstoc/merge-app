@@ -2,6 +2,8 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -27,29 +29,51 @@ const MAX_REMEMBERED_DELIVERIES: usize = 10_000;
 
 type HmacSha256 = Hmac<Sha256>;
 type ScheduleRepository = dyn Fn(RepositoryLocator) -> anyhow::Result<()> + Send + Sync;
+type RemovalFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+type RemoveInstallation = dyn Fn(u64) -> RemovalFuture + Send + Sync;
+type ApplyLifecycleChange = dyn Fn(LifecycleChange) + Send + Sync;
+
+#[derive(Clone, Debug)]
+pub enum LifecycleChange {
+    InstallationRemoved(u64),
+    InstallationRestored(u64),
+    RepositoryRemoved(RepositoryLocator),
+    RepositoryRestored(RepositoryLocator),
+}
 
 pub struct WebhookState {
     secret: Vec<u8>,
     allowed_accounts: HashSet<u64>,
     schedule_repository: Box<ScheduleRepository>,
+    remove_installation: Box<RemoveInstallation>,
+    apply_lifecycle_change: Box<ApplyLifecycleChange>,
     reconcile: Arc<Notify>,
     deliveries: Mutex<DeliveryCache>,
 }
 
 impl WebhookState {
-    pub fn new<F>(
+    pub fn new<F, R, Fut, A>(
         secret: &[u8],
         allowed_accounts: &[u64],
         schedule_repository: F,
         reconcile: Arc<Notify>,
+        remove_installation: R,
+        apply_lifecycle_change: A,
     ) -> Self
     where
         F: Fn(RepositoryLocator) -> anyhow::Result<()> + Send + Sync + 'static,
+        R: Fn(u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+        A: Fn(LifecycleChange) + Send + Sync + 'static,
     {
         Self {
             secret: secret.to_vec(),
             allowed_accounts: allowed_accounts.iter().copied().collect(),
             schedule_repository: Box::new(schedule_repository),
+            remove_installation: Box::new(move |installation_id| {
+                Box::pin(remove_installation(installation_id))
+            }),
+            apply_lifecycle_change: Box::new(apply_lifecycle_change),
             reconcile,
             deliveries: Mutex::new(DeliveryCache::default()),
         }
@@ -75,6 +99,11 @@ impl DeliveryCache {
         }
         self.ids.insert(id.clone());
         self.order.push_back(id);
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.ids.remove(id);
+        self.order.retain(|remembered| remembered != id);
     }
 }
 
@@ -170,14 +199,21 @@ async fn receive_webhook(
         }
     };
 
-    // Keep the short critical section around scheduling and recording the ID.
-    // A failed schedule must remain retryable, and concurrent duplicate
-    // deliveries must not both pass the deduplication check.
-    let mut deliveries = state
-        .deliveries
-        .lock()
-        .expect("webhook delivery cache lock poisoned");
-    if deliveries.contains(&delivery_id) {
+    // Claim the delivery before processing. Failures remove the claim below
+    // so GitHub can retry them.
+    let duplicate = {
+        let mut deliveries = state
+            .deliveries
+            .lock()
+            .expect("webhook delivery cache lock poisoned");
+        if deliveries.contains(&delivery_id) {
+            true
+        } else {
+            deliveries.insert(delivery_id.clone());
+            false
+        }
+    };
+    if duplicate {
         info!(
             event = "github_webhook_received",
             delivery_id = %delivery_id,
@@ -187,8 +223,9 @@ async fn receive_webhook(
         return StatusCode::ACCEPTED;
     }
 
-    match action {
+    let result = match action {
         EventAction::Repositories(repositories) => {
+            let mut schedule_result = Ok(());
             for repository in repositories {
                 if let Err(error) = (state.schedule_repository)(repository) {
                     warn!(
@@ -197,14 +234,61 @@ async fn receive_webhook(
                         event_type = %event_type,
                         error = %error,
                     );
-                    return StatusCode::INTERNAL_SERVER_ERROR;
+                    schedule_result = Err(error);
+                    break;
+                }
+            }
+            schedule_result
+        }
+        EventAction::RemoveInstallation {
+            installation_id,
+            account_id,
+        } => {
+            (state.apply_lifecycle_change)(LifecycleChange::InstallationRemoved(installation_id));
+            match (state.remove_installation)(installation_id).await {
+                Ok(()) => {
+                    info!(
+                        event = "installation_uninstalled",
+                        delivery_id = %delivery_id,
+                        installation_id,
+                        account_id,
+                        reason = "account_not_allowlisted",
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    warn!(
+                        event = "installation_removal_failed",
+                        delivery_id = %delivery_id,
+                        installation_id,
+                        account_id,
+                        retry = "webhook_or_reconciliation",
+                        error = %error,
+                    );
+                    Err(error)
                 }
             }
         }
-        EventAction::Reconcile => state.reconcile.notify_one(),
-        EventAction::Ignore => {}
+        EventAction::Lifecycle { changes, reconcile } => {
+            for change in changes {
+                (state.apply_lifecycle_change)(change);
+            }
+            if reconcile {
+                state.reconcile.notify_one();
+            }
+            Ok(())
+        }
+        EventAction::Ignore => Ok(()),
+    };
+
+    if result.is_err() {
+        state
+            .deliveries
+            .lock()
+            .expect("webhook delivery cache lock poisoned")
+            .remove(&delivery_id);
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
-    deliveries.insert(delivery_id.clone());
     info!(
         event = "github_webhook_received",
         delivery_id = %delivery_id,
@@ -257,12 +341,20 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 enum EventAction {
     Repositories(Vec<RepositoryLocator>),
-    Reconcile,
+    RemoveInstallation {
+        installation_id: u64,
+        account_id: u64,
+    },
+    Lifecycle {
+        changes: Vec<LifecycleChange>,
+        reconcile: bool,
+    },
     Ignore,
 }
 
 #[derive(Deserialize)]
 struct InstallationEvent {
+    action: String,
     installation: InstallationPayload,
 }
 
@@ -274,7 +366,18 @@ struct RepositoryEvent {
 
 #[derive(Deserialize)]
 struct InstallationRepositoriesEvent {
+    action: String,
     installation: InstallationPayload,
+    #[serde(default)]
+    repositories_added: Vec<InstallationRepositoryPayload>,
+    #[serde(default)]
+    repositories_removed: Vec<InstallationRepositoryPayload>,
+}
+
+#[derive(Deserialize)]
+struct InstallationRepositoryPayload {
+    name: String,
+    full_name: String,
 }
 
 #[derive(Deserialize)]
@@ -352,30 +455,61 @@ fn decode_action(
         }
         "installation_repositories" => {
             let event: InstallationRepositoriesEvent = serde_json::from_value(payload)?;
-            if event.installation.id == 0 {
+            if event.installation.id == 0 || event.installation.account.id == 0 {
                 return Err(serde_json::Error::custom(
-                    "installation ID must be positive",
+                    "installation and account IDs must be positive",
                 ));
             }
             if !allowed_accounts.contains(&event.installation.account.id) {
                 return Ok(EventAction::Ignore);
             }
-            // GitHub uses abbreviated repository objects for this event. A
-            // reconciliation reads the authoritative repository list and also
-            // handles removals, so do not decode those objects as full repos.
-            Ok(EventAction::Reconcile)
+            let mut changes = Vec::new();
+            for repository in event.repositories_removed {
+                changes.push(LifecycleChange::RepositoryRemoved(
+                    repository_locator_from_full_name(event.installation.id, repository)?,
+                ));
+            }
+            for repository in event.repositories_added {
+                changes.push(LifecycleChange::RepositoryRestored(
+                    repository_locator_from_full_name(event.installation.id, repository)?,
+                ));
+            }
+            match event.action.as_str() {
+                "added" | "removed" => Ok(EventAction::Lifecycle {
+                    changes,
+                    reconcile: true,
+                }),
+                _ => Ok(EventAction::Ignore),
+            }
         }
         "installation" => {
             let event: InstallationEvent = serde_json::from_value(payload)?;
-            if event.installation.id == 0 {
+            if event.installation.id == 0 || event.installation.account.id == 0 {
                 return Err(serde_json::Error::custom(
-                    "installation ID must be positive",
+                    "installation and account IDs must be positive",
                 ));
             }
-            if allowed_accounts.contains(&event.installation.account.id) {
-                Ok(EventAction::Reconcile)
-            } else {
-                Ok(EventAction::Ignore)
+            let installation_id = event.installation.id;
+            let account_id = event.installation.account.id;
+            let allowed = allowed_accounts.contains(&account_id);
+            match event.action.as_str() {
+                "created" if allowed => Ok(EventAction::Lifecycle {
+                    changes: vec![LifecycleChange::InstallationRestored(installation_id)],
+                    reconcile: true,
+                }),
+                "created" => Ok(EventAction::RemoveInstallation {
+                    installation_id,
+                    account_id,
+                }),
+                "deleted" | "suspended" => Ok(EventAction::Lifecycle {
+                    changes: vec![LifecycleChange::InstallationRemoved(installation_id)],
+                    reconcile: true,
+                }),
+                "unsuspended" if allowed => Ok(EventAction::Lifecycle {
+                    changes: vec![LifecycleChange::InstallationRestored(installation_id)],
+                    reconcile: true,
+                }),
+                _ => Ok(EventAction::Ignore),
             }
         }
         _ => Ok(EventAction::Ignore),
@@ -388,6 +522,22 @@ fn repository_locator(
 ) -> serde_json::Result<RepositoryLocator> {
     RepositoryLocator::new(installation_id, repository.owner.login, repository.name)
         .map_err(serde_json::Error::custom)
+}
+
+fn repository_locator_from_full_name(
+    installation_id: u64,
+    repository: InstallationRepositoryPayload,
+) -> serde_json::Result<RepositoryLocator> {
+    let (owner, name) = repository
+        .full_name
+        .split_once('/')
+        .ok_or_else(|| serde_json::Error::custom("repository full_name must contain owner/name"))?;
+    if name != repository.name || owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(serde_json::Error::custom(
+            "repository full_name does not match its name",
+        ));
+    }
+    RepositoryLocator::new(installation_id, owner, name).map_err(serde_json::Error::custom)
 }
 
 #[cfg(test)]
@@ -420,6 +570,8 @@ mod tests {
             &[1],
             move |repository| scheduled_tx.send(repository).map_err(anyhow::Error::msg),
             Arc::new(Notify::new()),
+            |_| async { Ok(()) },
+            |_| {},
         ));
         (state, scheduled_rx)
     }
@@ -656,9 +808,11 @@ mod tests {
             &[1],
             |_| Ok(()),
             Arc::clone(&reconcile),
+            |_| async { Ok(()) },
+            |_| {},
         ));
         let app = router(state);
-        let body = br#"{"action":"added","installation":{"id":17,"account":{"id":1}},"repositories_added":[{"id":99,"name":"merge-app","full_name":"dstoc/merge-app"}]}"#;
+        let body = br#"{"action":"removed","installation":{"id":17,"account":{"id":1}},"repositories_removed":[{"id":99,"name":"merge-app","full_name":"dstoc/merge-app"}]}"#;
         let request = signed_request("installation_repositories", "delivery-repositories", body);
 
         let response = app.oneshot(request).await.unwrap();
@@ -744,9 +898,11 @@ mod tests {
             &[1],
             |_| Ok(()),
             Arc::clone(&reconcile),
+            |_| async { Ok(()) },
+            |_| {},
         ));
         let app = router(state);
-        let body = br#"{"installation":{"id":17,"account":{"id":1}}}"#;
+        let body = br#"{"action":"created","installation":{"id":17,"account":{"id":1}}}"#;
         let request = signed_request("installation", "delivery-installation", body);
 
         let response = app.oneshot(request).await.unwrap();
@@ -755,6 +911,164 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
             .await
             .expect("installation event should wake reconciliation");
+    }
+
+    #[tokio::test]
+    async fn unallowlisted_installation_creation_is_removed() {
+        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
+        let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::new(Notify::new()),
+            move |installation_id| {
+                let removed_tx = removed_tx.clone();
+                async move { removed_tx.send(installation_id).map_err(anyhow::Error::msg) }
+            },
+            move |change| changes_tx.send(change).unwrap(),
+        ));
+        let app = router(state);
+        let body = br#"{"action":"created","installation":{"id":17,"account":{"id":2}}}"#;
+
+        let response = app
+            .oneshot(signed_request("installation", "delivery-unlisted", body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(removed_rx.try_recv().unwrap(), 17);
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::InstallationRemoved(17)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_installation_removal_returns_500_and_keeps_delivery_retryable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let removal_calls = Arc::clone(&calls);
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::new(Notify::new()),
+            move |_| {
+                let call = removal_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        anyhow::bail!("simulated GitHub API failure");
+                    }
+                    Ok(())
+                }
+            },
+            |_| {},
+        ));
+        let app = router(state);
+        let body = br#"{"action":"created","installation":{"id":17,"account":{"id":2}}}"#;
+
+        let first = app
+            .clone()
+            .oneshot(signed_request("installation", "delivery-retry", body))
+            .await
+            .unwrap();
+        let retry = app
+            .oneshot(signed_request("installation", "delivery-retry", body))
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn installation_removal_blocks_work_and_reconciles() {
+        let reconcile = Arc::new(Notify::new());
+        let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::clone(&reconcile),
+            |_| async { Ok(()) },
+            move |change| changes_tx.send(change).unwrap(),
+        ));
+        let app = router(state);
+        let body = br#"{"action":"deleted","installation":{"id":17,"account":{"id":1}}}"#;
+
+        let response = app
+            .oneshot(signed_request("installation", "delivery-deleted", body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::InstallationRemoved(17)
+        ));
+        tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
+            .await
+            .expect("installation deletion should wake reconciliation");
+    }
+
+    #[tokio::test]
+    async fn repository_access_changes_remove_and_restore_repository_scheduling() {
+        let reconcile = Arc::new(Notify::new());
+        let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::clone(&reconcile),
+            |_| async { Ok(()) },
+            move |change| changes_tx.send(change).unwrap(),
+        ));
+        let app = router(state);
+        let removed = br#"{"action":"removed","installation":{"id":17,"account":{"id":1}},"repositories_removed":[{"id":99,"name":"old","full_name":"dstoc/old"}]}"#;
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                "installation_repositories",
+                "delivery-repo-removed",
+                removed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::RepositoryRemoved(repository)
+                if repository.installation_id == 17
+                    && repository.owner == "dstoc"
+                    && repository.name == "old"
+        ));
+        tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
+            .await
+            .expect("repository removal should wake reconciliation");
+
+        let added = br#"{"action":"added","installation":{"id":17,"account":{"id":1}},"repositories_added":[{"id":100,"name":"new","full_name":"dstoc/new"}]}"#;
+        let response = app
+            .oneshot(signed_request(
+                "installation_repositories",
+                "delivery-repo-added",
+                added,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::RepositoryRestored(repository)
+                if repository.installation_id == 17
+                    && repository.owner == "dstoc"
+                    && repository.name == "new"
+        ));
+        tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
+            .await
+            .expect("repository addition should wake reconciliation");
     }
 
     #[tokio::test]

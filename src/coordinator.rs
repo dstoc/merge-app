@@ -1,7 +1,7 @@
 //! In-memory scheduling and serialization for repository queue work.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
 };
@@ -22,10 +22,18 @@ pub struct RepositoryWorkCoordinator<F> {
 }
 
 struct CoordinatorInner<F> {
+    state: Mutex<CoordinatorState>,
+    advance: F,
+}
+
+#[derive(Default)]
+struct CoordinatorState {
     /// The presence of a key means a worker is scheduled or running. Its value
     /// is true when the worker has work to perform.
-    repositories: Mutex<HashMap<RepositoryKey, bool>>,
-    advance: F,
+    repositories: HashMap<RepositoryKey, bool>,
+    blocked_installations: HashSet<u64>,
+    blocked_repositories: HashSet<RepositoryKey>,
+    scheduling_epoch: u64,
 }
 
 /// GitHub repository names are case-insensitive. Normalize them here so that
@@ -61,7 +69,7 @@ impl<F> RepositoryWorkCoordinator<F> {
     pub fn new(advance: F) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
-                repositories: Mutex::new(HashMap::new()),
+                state: Mutex::new(CoordinatorState::default()),
                 advance,
             }),
         }
@@ -77,23 +85,44 @@ impl<F> RepositoryWorkCoordinator<F> {
         F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let epoch = self.scheduling_epoch();
+        self.mark_dirty_at_epoch(repository, epoch).map(|_| ())
+    }
+
+    /// Mark a repository dirty only if no lifecycle event changed the
+    /// authoritative scheduling view since the caller began reconciliation.
+    pub fn mark_dirty_at_epoch<Fut>(
+        &self,
+        repository: RepositoryLocator,
+        expected_epoch: u64,
+    ) -> Result<bool>
+    where
+        F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
         let runtime = tokio::runtime::Handle::try_current()
             .context("repository work must be scheduled from a Tokio runtime")?;
         let key = RepositoryKey::from(&repository);
 
         let start_worker = {
-            let mut repositories = self
+            let mut state = self
                 .inner
-                .repositories
+                .state
                 .lock()
                 .expect("repository coordinator lock poisoned");
-            match repositories.get_mut(&key) {
+            if state.scheduling_epoch != expected_epoch
+                || state.blocked_installations.contains(&key.installation_id)
+                || state.blocked_repositories.contains(&key)
+            {
+                return Ok(false);
+            }
+            match state.repositories.get_mut(&key) {
                 Some(dirty) => {
                     *dirty = true;
                     false
                 }
                 None => {
-                    repositories.insert(key.clone(), true);
+                    state.repositories.insert(key.clone(), true);
                     true
                 }
             }
@@ -102,7 +131,71 @@ impl<F> RepositoryWorkCoordinator<F> {
         if start_worker {
             runtime.spawn(run_worker(Arc::clone(&self.inner), key, repository));
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Capture the scheduling view before an authoritative GitHub read.
+    pub fn scheduling_epoch(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .expect("repository coordinator lock poisoned")
+            .scheduling_epoch
+    }
+
+    /// Stop future work for an installation and clear any coalesced work.
+    pub fn block_installation(&self, installation_id: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("repository coordinator lock poisoned");
+        state.scheduling_epoch = state.scheduling_epoch.wrapping_add(1);
+        state.blocked_installations.insert(installation_id);
+        for (key, dirty) in &mut state.repositories {
+            if key.installation_id == installation_id {
+                *dirty = false;
+            }
+        }
+    }
+
+    /// Re-enable an installation after an authorized installation event.
+    pub fn unblock_installation(&self, installation_id: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("repository coordinator lock poisoned");
+        state.scheduling_epoch = state.scheduling_epoch.wrapping_add(1);
+        state.blocked_installations.remove(&installation_id);
+    }
+
+    /// Stop future work for a repository removed from an installation.
+    pub fn block_repository(&self, repository: &RepositoryLocator) {
+        let key = RepositoryKey::from(repository);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("repository coordinator lock poisoned");
+        state.scheduling_epoch = state.scheduling_epoch.wrapping_add(1);
+        state.blocked_repositories.insert(key.clone());
+        if let Some(dirty) = state.repositories.get_mut(&key) {
+            *dirty = false;
+        }
+    }
+
+    /// Re-enable a repository after GitHub reports that access was restored.
+    pub fn unblock_repository(&self, repository: &RepositoryLocator) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("repository coordinator lock poisoned");
+        state.scheduling_epoch = state.scheduling_epoch.wrapping_add(1);
+        state
+            .blocked_repositories
+            .remove(&RepositoryKey::from(repository));
     }
 }
 
@@ -116,20 +209,27 @@ async fn run_worker<F, Fut>(
 {
     loop {
         let has_work = {
-            let mut repositories = inner
-                .repositories
+            let mut state = inner
+                .state
                 .lock()
                 .expect("repository coordinator lock poisoned");
-            match repositories.get_mut(&key) {
-                Some(dirty) if *dirty => {
-                    *dirty = false;
-                    true
+            let blocked = state.blocked_installations.contains(&key.installation_id)
+                || state.blocked_repositories.contains(&key);
+            if blocked {
+                state.repositories.remove(&key);
+                false
+            } else {
+                match state.repositories.get_mut(&key) {
+                    Some(dirty) if *dirty => {
+                        *dirty = false;
+                        true
+                    }
+                    Some(_) => {
+                        state.repositories.remove(&key);
+                        false
+                    }
+                    None => false,
                 }
-                Some(_) => {
-                    repositories.remove(&key);
-                    false
-                }
-                None => false,
             }
         };
 
@@ -167,6 +267,53 @@ mod tests {
 
     fn repository(name: &str) -> RepositoryLocator {
         RepositoryLocator::new(1, "owner", name).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_blocks_retire_work_and_fence_stale_reconciliation_results() {
+        let (scheduled_tx, mut scheduled_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
+            let scheduled_tx = scheduled_tx.clone();
+            async move {
+                scheduled_tx.send(repository.name).unwrap();
+                Ok(())
+            }
+        });
+        let removed_repository = repository("removed");
+        let stale_epoch = coordinator.scheduling_epoch();
+
+        coordinator.block_repository(&removed_repository);
+        assert!(
+            !coordinator
+                .mark_dirty_at_epoch(removed_repository.clone(), stale_epoch)
+                .unwrap()
+        );
+        assert!(
+            !coordinator
+                .mark_dirty_at_epoch(removed_repository.clone(), coordinator.scheduling_epoch())
+                .unwrap()
+        );
+        coordinator.block_installation(1);
+        assert!(
+            !coordinator
+                .mark_dirty_at_epoch(repository("another"), coordinator.scheduling_epoch())
+                .unwrap()
+        );
+        assert!(scheduled_rx.try_recv().is_err());
+
+        coordinator.unblock_installation(1);
+        coordinator.unblock_repository(&removed_repository);
+        assert!(
+            coordinator
+                .mark_dirty_at_epoch(removed_repository, coordinator.scheduling_epoch())
+                .unwrap()
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), scheduled_rx.recv())
+                .await
+                .unwrap(),
+            Some("removed".to_owned())
+        );
     }
 
     #[tokio::test]

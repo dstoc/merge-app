@@ -2,7 +2,7 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{net::TcpListener, sync::Notify, time};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     auth::{
@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     coordinator::RepositoryWorkCoordinator,
     github::RepositoryLocator,
-    webhook::{self, WebhookState},
+    webhook::{self, LifecycleChange, WebhookState},
 };
 
 trait InstallationDiscovery {
@@ -26,6 +26,11 @@ trait InstallationDiscovery {
         &'a self,
         credentials: &'a InstallationCredentials,
     ) -> impl Future<Output = Result<Vec<InstallationRepository>>> + Send + 'a;
+
+    fn uninstall_installation(
+        &self,
+        installation_id: u64,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 impl InstallationDiscovery for GitHubAppAuthenticator {
@@ -54,6 +59,17 @@ impl InstallationDiscovery for GitHubAppAuthenticator {
     ) -> impl Future<Output = Result<Vec<InstallationRepository>>> + Send + 'a {
         async move {
             GitHubAppAuthenticator::installation_repositories(self, credentials)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    fn uninstall_installation(
+        &self,
+        installation_id: u64,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            GitHubAppAuthenticator::uninstall_installation(self, installation_id)
                 .await
                 .map_err(Into::into)
         }
@@ -121,7 +137,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         }
     });
     let reconciler = ServiceReconciler {
-        authenticator,
+        authenticator: Arc::clone(&authenticator),
         allowed_accounts: config.allowed_accounts.clone(),
         coordinator: coordinator.clone(),
     };
@@ -136,11 +152,38 @@ pub async fn run(config: AppConfig) -> Result<()> {
         })?;
     let reconcile_signal = Arc::new(Notify::new());
     let webhook_coordinator = coordinator.clone();
+    let removal_authenticator = Arc::clone(&authenticator);
     let webhook_state = Arc::new(WebhookState::new(
         config.webhook_secret.as_bytes(),
         &config.allowed_accounts,
         move |repository| webhook_coordinator.mark_dirty(repository),
         Arc::clone(&reconcile_signal),
+        move |installation_id| {
+            let authenticator = Arc::clone(&removal_authenticator);
+            async move {
+                authenticator
+                    .uninstall_installation(installation_id)
+                    .await
+                    .map_err(Into::into)
+            }
+        },
+        {
+            let coordinator = coordinator.clone();
+            move |change| match change {
+                LifecycleChange::InstallationRemoved(installation_id) => {
+                    coordinator.block_installation(installation_id);
+                }
+                LifecycleChange::InstallationRestored(installation_id) => {
+                    coordinator.unblock_installation(installation_id);
+                }
+                LifecycleChange::RepositoryRemoved(repository) => {
+                    coordinator.block_repository(&repository);
+                }
+                LifecycleChange::RepositoryRestored(repository) => {
+                    coordinator.unblock_repository(&repository);
+                }
+            }
+        },
     ));
     let mut webhook_server = tokio::spawn(async move {
         axum::serve(listener, webhook::router(webhook_state))
@@ -179,6 +222,7 @@ where
     F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    let scheduling_epoch = coordinator.scheduling_epoch();
     let installations = source
         .app_installations()
         .await
@@ -196,12 +240,28 @@ where
             continue;
         };
         if !allowed_accounts.contains(&account.id) {
-            debug!(
-                event = "installation_ignored",
+            info!(
+                event = "installation_uninstall_requested",
                 installation_id = installation.id,
                 account_id = account.id,
                 reason = "account_not_allowlisted",
             );
+            if let Err(removal_error) = source.uninstall_installation(installation.id).await {
+                warn!(
+                    event = "installation_removal_failed",
+                    installation_id = installation.id,
+                    account_id = account.id,
+                    retry = "reconciliation",
+                    error = %removal_error,
+                );
+            } else {
+                info!(
+                    event = "installation_uninstalled",
+                    installation_id = installation.id,
+                    account_id = account.id,
+                    reason = "account_not_allowlisted",
+                );
+            }
             continue;
         }
 
@@ -245,8 +305,9 @@ where
                     continue;
                 }
             };
-            coordinator.mark_dirty(locator)?;
-            marked_repositories += 1;
+            if coordinator.mark_dirty_at_epoch(locator, scheduling_epoch)? {
+                marked_repositories += 1;
+            }
         }
         info!(
             event = "installation_reconciled",
@@ -378,6 +439,8 @@ mod tests {
         installations: Vec<AppInstallation>,
         repositories: HashMap<u64, Vec<InstallationRepository>>,
         failing_repository_installs: HashSet<u64>,
+        failing_removal_attempts: Mutex<HashMap<u64, usize>>,
+        removal_requests: Mutex<Vec<u64>>,
         token_requests: Mutex<Vec<u64>>,
         repository_requests: Mutex<Vec<u64>>,
     }
@@ -420,6 +483,18 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+
+        async fn uninstall_installation(&self, installation_id: u64) -> Result<()> {
+            self.removal_requests.lock().unwrap().push(installation_id);
+            let mut failing_attempts = self.failing_removal_attempts.lock().unwrap();
+            if let Some(remaining) = failing_attempts.get_mut(&installation_id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                anyhow::bail!("simulated installation removal failure");
+            }
+            Ok(())
+        }
     }
 
     fn installation(id: u64, account_id: Option<u64>) -> AppInstallation {
@@ -455,6 +530,8 @@ mod tests {
                 ],
             )]),
             failing_repository_installs: HashSet::from([11]),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
             token_requests: Mutex::new(Vec::new()),
             repository_requests: Mutex::new(Vec::new()),
         };
@@ -498,6 +575,37 @@ mod tests {
         );
         assert_eq!(*discovery.token_requests.lock().unwrap(), vec![10, 11]);
         assert_eq!(*discovery.repository_requests.lock().unwrap(), vec![10, 11]);
+        assert_eq!(*discovery.removal_requests.lock().unwrap(), vec![20]);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retries_unallowlisted_installation_removal_on_the_next_pass() {
+        let discovery = FakeDiscovery {
+            installations: vec![installation(20, Some(200))],
+            repositories: HashMap::new(),
+            failing_repository_installs: HashSet::new(),
+            failing_removal_attempts: Mutex::new(HashMap::from([(20, 1)])),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+        };
+        let coordinator =
+            RepositoryWorkCoordinator::new(|_repository: RepositoryLocator| async { Ok(()) });
+
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(*discovery.removal_requests.lock().unwrap(), vec![20, 20]);
     }
 
     struct CountingReconciler {
