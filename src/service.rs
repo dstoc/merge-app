@@ -182,6 +182,9 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 LifecycleChange::RepositoryRestored(repository) => {
                     coordinator.unblock_repository(&repository);
                 }
+                LifecycleChange::RepositoryAccessChanged(installation_id) => {
+                    coordinator.require_repository_refresh(installation_id);
+                }
             }
         },
     ));
@@ -289,6 +292,7 @@ where
         };
 
         let repository_count = repositories.len();
+        let mut repository_locators = Vec::with_capacity(repository_count);
         for repository in repositories {
             let locator = match RepositoryLocator::new(
                 installation.id,
@@ -305,6 +309,21 @@ where
                     continue;
                 }
             };
+            repository_locators.push(locator);
+        }
+        if !coordinator.apply_authoritative_repository_listing(
+            installation.id,
+            &repository_locators,
+            scheduling_epoch,
+        ) {
+            warn!(
+                event = "installation_reconciliation_stale",
+                installation_id = installation.id,
+                reason = "lifecycle_changed_or_installation_blocked",
+            );
+            continue;
+        }
+        for locator in repository_locators {
             if coordinator.mark_dirty_at_epoch(locator, scheduling_epoch)? {
                 marked_repositories += 1;
             }
@@ -576,6 +595,44 @@ mod tests {
         assert_eq!(*discovery.token_requests.lock().unwrap(), vec![10, 11]);
         assert_eq!(*discovery.repository_requests.lock().unwrap(), vec![10, 11]);
         assert_eq!(*discovery.removal_requests.lock().unwrap(), vec![20]);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_restores_access_from_the_authoritative_listing() {
+        let discovery = FakeDiscovery {
+            installations: vec![installation(10, Some(100))],
+            repositories: HashMap::from([(10, vec![repository("Allowed", "restored")])]),
+            failing_repository_installs: HashSet::new(),
+            failing_removal_attempts: Mutex::new(HashMap::new()),
+            removal_requests: Mutex::new(Vec::new()),
+            token_requests: Mutex::new(Vec::new()),
+            repository_requests: Mutex::new(Vec::new()),
+        };
+        let (scheduled_tx, mut scheduled_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new(move |repository: RepositoryLocator| {
+            let scheduled_tx = scheduled_tx.clone();
+            async move {
+                scheduled_tx
+                    .send((repository.owner, repository.name))
+                    .unwrap();
+                Ok(())
+            }
+        });
+        let restored = RepositoryLocator::new(10, "Allowed", "restored").unwrap();
+        coordinator.block_repository(&restored);
+
+        assert_eq!(
+            reconcile_once(&discovery, &[100], &coordinator)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), scheduled_rx.recv())
+                .await
+                .unwrap(),
+            Some(("Allowed".to_owned(), "restored".to_owned()))
+        );
     }
 
     #[tokio::test]

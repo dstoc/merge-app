@@ -39,6 +39,7 @@ pub enum LifecycleChange {
     InstallationRestored(u64),
     RepositoryRemoved(RepositoryLocator),
     RepositoryRestored(RepositoryLocator),
+    RepositoryAccessChanged(u64),
 }
 
 pub struct WebhookState {
@@ -475,10 +476,15 @@ fn decode_action(
                 ));
             }
             match event.action.as_str() {
-                "added" | "removed" => Ok(EventAction::Lifecycle {
-                    changes,
-                    reconcile: true,
-                }),
+                "added" | "removed" => {
+                    changes.push(LifecycleChange::RepositoryAccessChanged(
+                        event.installation.id,
+                    ));
+                    Ok(EventAction::Lifecycle {
+                        changes,
+                        reconcile: true,
+                    })
+                }
                 _ => Ok(EventAction::Ignore),
             }
         }
@@ -749,6 +755,8 @@ mod tests {
             &[1],
             move |repository| coordinator.mark_dirty(repository),
             Arc::new(Notify::new()),
+            |_| async { Ok(()) },
+            |_| {},
         ));
         let app = router(state);
 
@@ -821,6 +829,40 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
             .await
             .expect("installation repositories event should wake reconciliation");
+    }
+
+    #[tokio::test]
+    async fn empty_repository_removal_event_invalidates_access_and_reconciles() {
+        let reconcile = Arc::new(Notify::new());
+        let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            |_| Ok(()),
+            Arc::clone(&reconcile),
+            |_| async { Ok(()) },
+            move |change| changes_tx.send(change).unwrap(),
+        ));
+        let app = router(state);
+        let body = br#"{"action":"removed","installation":{"id":17,"account":{"id":1}},"repositories_removed":[]}"#;
+
+        let response = app
+            .oneshot(signed_request(
+                "installation_repositories",
+                "delivery-empty-removal",
+                body,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::RepositoryAccessChanged(17)
+        ));
+        tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
+            .await
+            .expect("empty repository removal should wake reconciliation");
     }
 
     #[tokio::test]
@@ -1045,6 +1087,10 @@ mod tests {
                     && repository.owner == "dstoc"
                     && repository.name == "old"
         ));
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::RepositoryAccessChanged(17)
+        ));
         tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
             .await
             .expect("repository removal should wake reconciliation");
@@ -1065,6 +1111,10 @@ mod tests {
                 if repository.installation_id == 17
                     && repository.owner == "dstoc"
                     && repository.name == "new"
+        ));
+        assert!(matches!(
+            changes_rx.try_recv().unwrap(),
+            LifecycleChange::RepositoryAccessChanged(17)
         ));
         tokio::time::timeout(std::time::Duration::from_millis(10), reconcile.notified())
             .await
