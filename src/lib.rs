@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod coordinator;
 pub mod github;
 pub mod pull_request;
 pub mod queue;
