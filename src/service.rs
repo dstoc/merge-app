@@ -1,7 +1,7 @@
 use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use tokio::time;
+use tokio::{net::TcpListener, sync::Notify, time};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
     config::AppConfig,
     coordinator::RepositoryWorkCoordinator,
     github::RepositoryLocator,
+    webhook::{self, WebhookState},
 };
 
 trait InstallationDiscovery {
@@ -122,17 +123,50 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let reconciler = ServiceReconciler {
         authenticator,
         allowed_accounts: config.allowed_accounts.clone(),
-        coordinator,
+        coordinator: coordinator.clone(),
     };
 
-    run_until(
+    let listener = TcpListener::bind(config.webhook_listen_addr)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind GitHub webhook listener at {}",
+                config.webhook_listen_addr
+            )
+        })?;
+    let reconcile_signal = Arc::new(Notify::new());
+    let webhook_coordinator = coordinator.clone();
+    let webhook_state = Arc::new(WebhookState::new(
+        config.webhook_secret.as_bytes(),
+        &config.allowed_accounts,
+        move |repository| webhook_coordinator.mark_dirty(repository),
+        Arc::clone(&reconcile_signal),
+    ));
+    let mut webhook_server = tokio::spawn(async move {
+        axum::serve(listener, webhook::router(webhook_state))
+            .await
+            .context("GitHub webhook server stopped")
+    });
+    info!(event = "github_webhook_server_started", listen_addr = %config.webhook_listen_addr);
+
+    tokio::select! {
+        result = run_until(
         config.app_id,
         config.allowed_accounts.len(),
         config.reconcile_interval,
         &reconciler,
+        &reconcile_signal,
         shutdown_signal(),
-    )
-    .await
+        ) => {
+            webhook_server.abort();
+            let _ = webhook_server.await;
+            result
+        }
+        server_result = &mut webhook_server => {
+            server_result.context("GitHub webhook server task failed")??;
+            Ok(())
+        }
+    }
 }
 
 async fn reconcile_once<S, F, Fut>(
@@ -234,6 +268,7 @@ async fn run_until<R, F>(
     allowed_account_count: usize,
     interval: Duration,
     reconciler: &R,
+    reconcile_signal: &Notify,
     shutdown: F,
 ) -> Result<()>
 where
@@ -257,6 +292,13 @@ where
             loop {
                 tokio::select! {
                     reason = &mut shutdown => break reason?,
+                    _ = reconcile_signal.notified() => {
+                        let result = tokio::select! {
+                            reason = &mut shutdown => break reason?,
+                            result = reconciler.reconcile() => result,
+                        };
+                        log_reconciliation(result);
+                    }
                     _ = ticker.tick() => {
                         let result = tokio::select! {
                             reason = &mut shutdown => break reason?,
@@ -320,7 +362,10 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::{
+        sync::{Notify, mpsc},
+        time::timeout,
+    };
 
     use super::*;
     use crate::auth::{InstallationAccount, RepositoryOwner};
@@ -480,12 +525,19 @@ mod tests {
             shutdown: Mutex::new(Some(shutdown_tx)),
         };
 
-        run_until(1, 0, Duration::from_millis(1), &reconciler, async move {
-            shutdown_rx
-                .await
-                .map(|()| "test signal")
-                .map_err(anyhow::Error::from)
-        })
+        run_until(
+            1,
+            0,
+            Duration::from_millis(1),
+            &reconciler,
+            &Notify::new(),
+            async move {
+                shutdown_rx
+                    .await
+                    .map(|()| "test signal")
+                    .map_err(anyhow::Error::from)
+            },
+        )
         .await
         .unwrap();
 
