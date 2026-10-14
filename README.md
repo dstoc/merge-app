@@ -56,9 +56,10 @@ The `p0-validate` binary runs the remaining Phase 0 checks against a GitHub App
 installation. It reads the private key from a local PEM file. It does not print
 the private key, App JWT, or installation token.
 
-Configure the test App with only **Pull requests: read/write**. Install it on a
-test repository. The tool verifies that the App and the minted installation
-token have only that permission, plus GitHub's implicit **Metadata: read**.
+Configure the test App with only **Contents: read/write** and **Pull requests:
+read/write**. Install it on a test repository. The tool verifies that the App
+and the minted installation token have both permissions, plus GitHub's implicit
+**Metadata: read**.
 The tool finds the installation for the selected repository. Supply the App ID,
 test repository, and a suitable test PR. Use the App Client ID as the JWT issuer
 when required with `--issuer`.
@@ -76,10 +77,10 @@ cargo run --locked --bin p0-validate -- \
 ```
 
 This validates App JWT authentication with `GET /app`, mints an installation
-token scoped to the named repository with Pull requests: write, and queries the
-PR's state, draft status, review decision, mergeability, merge state, head and
-base OIDs, and native auto-merge request. It prints a JSON evidence report to
-standard output.
+token scoped to the named repository with Contents: write and Pull requests:
+write, and queries the PR's state, draft status, review decision, mergeability,
+merge state, head and base OIDs, and native auto-merge request. It prints a JSON
+evidence report to standard output.
 
 To run the mutation checks, add `--execute-rebase` only after confirming the
 read-only report describes the intended test PR:
@@ -111,7 +112,7 @@ final merge. Do not run mutation mode against a production PR.
 
 If GitHub rejects the rebase with these permissions, keep the permission set
 unchanged and save the JSON report and error for maintainer review. Do not add
-Contents: write. If auto-merge is disabled, report that result as well.
+other permissions. If auto-merge is disabled, report that result as well.
 
 ## Pull request rebase API
 

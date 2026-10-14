@@ -60,6 +60,62 @@ pub struct AppInfo {
     pub permissions: BTreeMap<String, String>,
 }
 
+/// Check that an App or repository-scoped worker token has the permissions
+/// required for GitHub's pull request rebase mutation.
+pub fn validate_worker_permissions(
+    permissions: &BTreeMap<String, String>,
+    source: &str,
+) -> Result<(), String> {
+    let missing = [
+        ("contents", "write", "Contents: write"),
+        ("pull_requests", "write", "Pull requests: write"),
+    ]
+    .into_iter()
+    .filter_map(|(name, access, label)| {
+        (permissions.get(name).map(String::as_str) != Some(access)).then_some(label)
+    })
+    .collect::<Vec<_>>();
+    let unexpected = permissions
+        .iter()
+        .filter(|(name, access)| {
+            !(name.as_str() == "metadata" && access.as_str() == "read")
+                && !(name.as_str() == "contents" && access.as_str() == "write")
+                && !(name.as_str() == "pull_requests" && access.as_str() == "write")
+        })
+        .map(|(name, access)| format!("{name}: {access}"))
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() && unexpected.is_empty() {
+        return Ok(());
+    }
+
+    let missing = if missing.is_empty() {
+        "none".to_owned()
+    } else {
+        missing.join(", ")
+    };
+    let unexpected = if unexpected.is_empty() {
+        "none".to_owned()
+    } else {
+        unexpected.join(", ")
+    };
+    Err(format!(
+        "{source} must have Contents: write and Pull requests: write, with no additional permissions; missing: {missing}; unexpected: {unexpected}; received: {}",
+        format_permissions(permissions)
+    ))
+}
+
+fn format_permissions(permissions: &BTreeMap<String, String>) -> String {
+    if permissions.is_empty() {
+        return "none".to_owned();
+    }
+    permissions
+        .iter()
+        .map(|(name, access)| format!("{name}: {access}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub struct InstallationCredentials {
     pub installation_id: u64,
     pub token: String,
@@ -483,7 +539,8 @@ impl GitHubAppAuthenticator {
             .await
     }
 
-    /// Return a cached repository-scoped token or mint one with Pull requests: write.
+    /// Return a cached repository-scoped token or mint one with Contents: write
+    /// and Pull requests: write.
     pub async fn installation_token(
         &self,
         installation_id: u64,
@@ -535,6 +592,7 @@ impl GitHubAppAuthenticator {
             return Ok(credentials);
         }
 
+        let repository_scoped = matches!(&scope, TokenScope::Repository { .. });
         let jwt = self.app_jwt()?;
         let mut request = self
             .client
@@ -549,7 +607,7 @@ impl GitHubAppAuthenticator {
             TokenScope::AllRepositories => request.json(&json!({"permissions": {}})),
             TokenScope::Repository { name, .. } => request.json(&json!({
                 "repositories": [name],
-                "permissions": {"pull_requests": "write"}
+                "permissions": {"contents": "write", "pull_requests": "write"}
             })),
         };
         let response = request.send().await.map_err(|error| {
@@ -582,6 +640,13 @@ impl GitHubAppAuthenticator {
             expires_at: token.expires_at,
             permissions: token.permissions,
         };
+        if repository_scoped {
+            validate_worker_permissions(
+                &credentials.permissions,
+                "repository-scoped installation token",
+            )
+            .map_err(AuthenticationError::Installation)?;
+        }
         self.token_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -976,7 +1041,7 @@ xwIDAQAB\n\
     }
 
     #[tokio::test]
-    async fn worker_token_uses_repository_name_and_pull_requests_write_permission() {
+    async fn worker_token_requests_and_validates_rebase_permissions() {
         use std::{
             io::{Read, Write},
             net::{TcpListener, TcpStream},
@@ -1028,7 +1093,7 @@ xwIDAQAB\n\
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&mut stream);
-            let body = r#"{"token":"worker-token","expires_at":"2030-01-01T00:00:00Z","permissions":{"pull_requests":"write"}}"#;
+            let body = r#"{"token":"worker-token","expires_at":"2030-01-01T00:00:00Z","permissions":{"contents":"write","pull_requests":"write"}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1064,9 +1129,91 @@ xwIDAQAB\n\
             serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
             json!({
                 "repositories": ["repo"],
-                "permissions": {"pull_requests": "write"}
+                "permissions": {"contents": "write", "pull_requests": "write"}
             })
         );
+    }
+
+    #[tokio::test]
+    async fn worker_token_without_effective_contents_write_is_rejected() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        fn read_request(stream: &mut TcpStream) {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + content_length {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            let body = r#"{"token":"worker-token","expires_at":"2030-01-01T00:00:00Z","permissions":{"pull_requests":"write"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut authenticator =
+            GitHubAppAuthenticator::new(1, "app-client-id", TEST_PRIVATE_KEY.as_bytes()).unwrap();
+        authenticator.api_root = format!("http://{address}");
+
+        let error = authenticator
+            .installation_token(7, "owner", "repo")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Contents: write"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_permission_check_requires_both_writes_and_rejects_extra_permissions() {
+        let valid = BTreeMap::from([
+            ("metadata".to_owned(), "read".to_owned()),
+            ("contents".to_owned(), "write".to_owned()),
+            ("pull_requests".to_owned(), "write".to_owned()),
+        ]);
+        assert!(validate_worker_permissions(&valid, "test App").is_ok());
+
+        let missing_contents = BTreeMap::from([("pull_requests".to_owned(), "write".to_owned())]);
+        let error = validate_worker_permissions(&missing_contents, "test token").unwrap_err();
+        assert!(error.contains("Contents: write"));
+
+        let extra = BTreeMap::from([
+            ("contents".to_owned(), "write".to_owned()),
+            ("pull_requests".to_owned(), "write".to_owned()),
+            ("administration".to_owned(), "write".to_owned()),
+        ]);
+        assert!(validate_worker_permissions(&extra, "test App").is_err());
     }
 
     #[test]
