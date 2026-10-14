@@ -1,19 +1,12 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use merge_app::auth::GitHubAppAuthenticator;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const API_ROOT: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
-const USER_AGENT: &str = "merge-app-p0-validation";
 
 const HELP: &str = "Usage: p0-validate --app-id ID --private-key PEM --owner OWNER --repo REPO --pr NUMBER [--issuer ID_OR_CLIENT_ID] [--execute-rebase]\n\n\
 Runs GitHub App authentication, installation-token, and pull-request read checks.\n\
@@ -31,34 +24,6 @@ struct Args {
     repo: String,
     pr_number: u64,
     execute_rebase: bool,
-}
-
-#[derive(Serialize)]
-struct Claims {
-    iat: u64,
-    exp: u64,
-    iss: String,
-}
-
-#[derive(Deserialize)]
-struct AppInfo {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    permissions: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct InstallationInfo {
-    id: u64,
-}
-
-#[derive(Deserialize)]
-struct InstallationToken {
-    token: String,
-    expires_at: String,
-    #[serde(default)]
-    permissions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,29 +72,22 @@ async fn run() -> Result<()> {
                 args.private_key.display()
             )
         })?;
-    let key = EncodingKey::from_rsa_pem(pem.as_bytes())
-        .context("private key file must contain a valid RSA PEM")?;
-    let jwt = create_app_jwt(args.issuer.clone(), &key)?;
-    let client = Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .context("could not create GitHub API client")?;
+    let authenticator =
+        GitHubAppAuthenticator::new(args.app_id, args.issuer.clone(), pem.as_bytes())?;
+    let client = authenticator.http_client();
 
-    let app = get_app(&client, &jwt).await?;
-    ensure!(
-        app.id == args.app_id,
-        "the private key authenticated as App {}, but --app-id is {}",
-        app.id,
-        args.app_id
-    );
+    let app = authenticator.verify_app().await?;
     validate_permissions(&app.permissions, "GitHub App")?;
 
-    let installation = get_repository_installation(&client, &jwt, &args).await?;
+    let installation_id = authenticator
+        .repository_installation(&args.owner, &args.repo)
+        .await?;
 
     // Ask GitHub to mint the narrowest token needed for this spike. GitHub also
     // returns the effective permissions, which are checked before any PR calls.
-    let installation_token =
-        create_installation_token(&client, &jwt, installation.id, &args.repo).await?;
+    let installation_token = authenticator
+        .installation_token(installation_id, &args.owner, &args.repo)
+        .await?;
     validate_permissions(&installation_token.permissions, "installation token")?;
 
     let initial = query_pull_request(&client, &installation_token.token, &args).await?;
@@ -142,7 +100,7 @@ async fn run() -> Result<()> {
         },
         "installation_lookup": {
             "succeeded": true,
-            "installation_id": installation.id,
+            "installation_id": installation_token.installation_id,
             "repository": format!("{}/{}", args.owner, args.repo),
         },
         "installation_token": {
@@ -273,85 +231,6 @@ async fn run() -> Result<()> {
     }
 
     print_evidence(&evidence)
-}
-
-fn create_app_jwt(issuer: String, key: &EncodingKey) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
-    let claims = Claims {
-        iat: now.saturating_sub(60),
-        exp: now + 9 * 60,
-        iss: issuer,
-    };
-    encode(&Header::new(Algorithm::RS256), &claims, key).context("could not sign GitHub App JWT")
-}
-
-async fn get_app(client: &Client, jwt: &str) -> Result<AppInfo> {
-    let response = client
-        .get(format!("{API_ROOT}/app"))
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .context("GET /app request failed")?;
-    let response = ensure_success(response, jwt).await?;
-    response
-        .json()
-        .await
-        .context("could not decode GET /app response")
-}
-
-async fn create_installation_token(
-    client: &Client,
-    jwt: &str,
-    installation_id: u64,
-    repo: &str,
-) -> Result<InstallationToken> {
-    let response = client
-        .post(format!(
-            "{API_ROOT}/app/installations/{installation_id}/access_tokens"
-        ))
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&json!({
-            "repositories": [repo],
-            "permissions": {"pull_requests": "write"}
-        }))
-        .send()
-        .await
-        .context("installation access token request failed")?;
-    let response = ensure_success(response, jwt).await?;
-    response
-        .json()
-        .await
-        .context("could not decode installation token response")
-}
-
-async fn get_repository_installation(
-    client: &Client,
-    jwt: &str,
-    args: &Args,
-) -> Result<InstallationInfo> {
-    let response = client
-        .get(format!(
-            "{API_ROOT}/repos/{}/{}/installation",
-            args.owner, args.repo
-        ))
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .context("repository installation lookup failed")?;
-    let response = ensure_success(response, jwt).await?;
-    response
-        .json()
-        .await
-        .context("could not decode repository installation response")
 }
 
 async fn query_pull_request(client: &Client, token: &str, args: &Args) -> Result<PullRequest> {
