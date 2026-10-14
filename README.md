@@ -9,6 +9,7 @@ Create `merge-app.toml` in the working directory:
 
 ```toml
 reconcile_interval = "5m"
+webhook_listen_addr = "127.0.0.1:8080"
 allowed_accounts = [1234567, 7654321]
 ```
 
@@ -19,12 +20,17 @@ environment:
 ```sh
 export GITHUB_APP_ID=123456
 export GITHUB_APP_PRIVATE_KEY_PATH=/path/to/private-key.pem
+export GITHUB_WEBHOOK_SECRET='shared secret configured in the GitHub App'
 cargo run
 ```
 
-The service reads the private key file at startup. It writes structured JSON
-logs to standard error and exits cleanly on SIGINT or SIGTERM. Set `RUST_LOG` to
-change the log filter.
+The service reads the private key file and webhook secret at startup. It serves
+`POST /github/webhook` at `webhook_listen_addr`, which defaults to
+`127.0.0.1:8080`. Set the address in `merge-app.toml` to match the local network
+and ingress setup. The service verifies the GitHub HMAC signature and rejects
+bodies larger than 1,000,000 bytes before it parses an event. It writes
+structured JSON logs to standard error and exits cleanly on SIGINT or SIGTERM.
+Set `RUST_LOG` to change the log filter.
 
 The service verifies its App credentials, then reconciles immediately and every
 `reconcile_interval`. Each pass lists App installations, keeps only accounts in
@@ -33,8 +39,9 @@ through the work coordinator. Repository workers use repository-scoped
 installation tokens to run the PR queue. Failures for one installation are
 logged and do not stop reconciliation of the other allowlisted installations.
 
-Phase 1 does not use webhooks or start an HTTP server. Periodic reconciliation
-is the mechanism that discovers repository state changes.
+Repository and pull request webhook events schedule repository work. Installation
+events request an immediate reconciliation. Periodic reconciliation remains the
+recovery path for missed webhook deliveries.
 
 ## Manual Phase 0 validation
 

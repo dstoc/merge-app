@@ -1,5 +1,6 @@
 use std::{
     env, fmt,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -9,12 +10,15 @@ use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "merge-app.toml";
 const DEFAULT_RECONCILE_INTERVAL: &str = "5m";
+const DEFAULT_WEBHOOK_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default = "default_reconcile_interval")]
     reconcile_interval: String,
+    #[serde(default = "default_webhook_listen_addr")]
+    webhook_listen_addr: String,
     allowed_accounts: Vec<u64>,
 }
 
@@ -23,6 +27,22 @@ pub struct AppConfig {
     pub private_key: PrivateKey,
     pub reconcile_interval: Duration,
     pub allowed_accounts: Vec<u64>,
+    pub webhook_listen_addr: SocketAddr,
+    pub webhook_secret: WebhookSecret,
+}
+
+pub struct WebhookSecret(String);
+
+impl WebhookSecret {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for WebhookSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WebhookSecret([REDACTED])")
+    }
 }
 
 pub struct PrivateKey(String);
@@ -50,14 +70,19 @@ pub async fn load() -> Result<AppConfig> {
         bail!("GITHUB_APP_ID must be greater than zero");
     }
     let private_key_path = PathBuf::from(required_env("GITHUB_APP_PRIVATE_KEY_PATH")?);
+    let webhook_secret = required_env("GITHUB_WEBHOOK_SECRET")?;
+    if webhook_secret.is_empty() {
+        bail!("GITHUB_WEBHOOK_SECRET must not be empty");
+    }
 
-    load_from(&config_path, app_id, &private_key_path).await
+    load_from(&config_path, app_id, &private_key_path, webhook_secret).await
 }
 
 pub(crate) async fn load_from(
     config_path: &Path,
     app_id: u64,
     private_key_path: &Path,
+    webhook_secret: String,
 ) -> Result<AppConfig> {
     if app_id == 0 {
         bail!("GITHUB_APP_ID must be greater than zero");
@@ -75,6 +100,10 @@ pub(crate) async fn load_from(
     if reconcile_interval.is_zero() {
         bail!("reconcile_interval must be greater than zero");
     }
+    let webhook_listen_addr = file_config
+        .webhook_listen_addr
+        .parse::<SocketAddr>()
+        .context("webhook_listen_addr must be a socket address such as `127.0.0.1:8080`")?;
 
     let private_key = tokio::fs::read_to_string(private_key_path)
         .await
@@ -93,6 +122,8 @@ pub(crate) async fn load_from(
         private_key: PrivateKey(private_key),
         reconcile_interval,
         allowed_accounts: file_config.allowed_accounts,
+        webhook_listen_addr,
+        webhook_secret: WebhookSecret(webhook_secret),
     })
 }
 
@@ -102,6 +133,10 @@ fn required_env(name: &str) -> Result<String> {
 
 fn default_reconcile_interval() -> String {
     DEFAULT_RECONCILE_INTERVAL.to_owned()
+}
+
+fn default_webhook_listen_addr() -> String {
+    DEFAULT_WEBHOOK_LISTEN_ADDR.to_owned()
 }
 
 #[cfg(test)]
@@ -142,6 +177,36 @@ mod tests {
             humantime::parse_duration(&file_config.reconcile_interval).unwrap(),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn config_uses_local_webhook_listen_address_by_default() {
+        let file_config: FileConfig = toml::from_str("allowed_accounts = []").unwrap();
+
+        assert_eq!(file_config.webhook_listen_addr, DEFAULT_WEBHOOK_LISTEN_ADDR);
+    }
+
+    #[test]
+    fn config_accepts_a_custom_webhook_listen_address() {
+        let file_config: FileConfig =
+            toml::from_str("webhook_listen_addr = \"0.0.0.0:9000\"\nallowed_accounts = []")
+                .unwrap();
+
+        assert_eq!(
+            file_config
+                .webhook_listen_addr
+                .parse::<SocketAddr>()
+                .unwrap(),
+            "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn webhook_secret_debug_output_is_redacted() {
+        let secret = WebhookSecret("secret value".to_owned());
+
+        assert_eq!(format!("{secret:?}"), "WebhookSecret([REDACTED])");
+        assert!(!format!("{secret:?}").contains("secret value"));
     }
 
     #[test]
