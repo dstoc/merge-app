@@ -286,14 +286,17 @@ where
     let mut ticker = time::interval_at(time::Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let shutdown_reason = tokio::select! {
+        biased;
         reason = &mut shutdown => reason?,
         result = reconciler.reconcile() => {
             log_reconciliation(result);
             loop {
                 tokio::select! {
+                    biased;
                     reason = &mut shutdown => break reason?,
                     _ = reconcile_signal.notified() => {
                         let result = tokio::select! {
+                            biased;
                             reason = &mut shutdown => break reason?,
                             result = reconciler.reconcile() => result,
                         };
@@ -301,6 +304,7 @@ where
                     }
                     _ = ticker.tick() => {
                         let result = tokio::select! {
+                            biased;
                             reason = &mut shutdown => break reason?,
                             result = reconciler.reconcile() => result,
                         };

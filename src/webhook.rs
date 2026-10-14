@@ -312,6 +312,29 @@ fn decode_action(
 ) -> serde_json::Result<EventAction> {
     match event_type {
         "pull_request" | "pull_request_review" => {
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| serde_json::Error::custom("event action is missing or invalid"))?;
+            let relevant = match event_type {
+                "pull_request" => matches!(
+                    action,
+                    "opened"
+                        | "reopened"
+                        | "closed"
+                        | "synchronize"
+                        | "converted_to_draft"
+                        | "ready_for_review"
+                        | "auto_merge_enabled"
+                        | "auto_merge_disabled"
+                ),
+                "pull_request_review" => matches!(action, "submitted" | "dismissed"),
+                _ => false,
+            };
+            if !relevant {
+                return Ok(EventAction::Ignore);
+            }
+
             let event: RepositoryEvent = serde_json::from_value(payload)?;
             if event.installation.id == 0 || event.repository.owner.id == 0 {
                 return Err(serde_json::Error::custom(
@@ -369,12 +392,18 @@ fn repository_locator(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     use axum::{body::Body, http::Request};
     use hmac::{KeyInit, Mac};
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{Notify, Semaphore, mpsc};
     use tower::ServiceExt;
+
+    use crate::{coordinator::RepositoryWorkCoordinator, github::RepositoryLocator};
 
     use super::*;
 
@@ -440,25 +469,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_request_review_with_simple_installation_schedules_repository() {
+    async fn relevant_pull_request_actions_schedule_the_repository() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+        let actions = [
+            "opened",
+            "auto_merge_enabled",
+            "auto_merge_disabled",
+            "synchronize",
+            "converted_to_draft",
+            "ready_for_review",
+            "reopened",
+            "closed",
+        ];
+
+        for (index, action) in actions.iter().enumerate() {
+            let body = REPOSITORY_PAYLOAD.replace("\"opened\"", &format!("\"{action}\""));
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    "pull_request",
+                    &format!("delivery-pull-{index}"),
+                    body.as_bytes(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "action {action}");
+        }
+
+        for _ in actions {
+            let repository = scheduled_rx.try_recv().unwrap();
+            assert_eq!(repository.installation_id, 17);
+            assert_eq!(repository.owner, "dstoc");
+            assert_eq!(repository.name, "merge-app");
+        }
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn submitted_and_dismissed_reviews_schedule_the_repository() {
         let (state, mut scheduled_rx) = test_state();
         let app = router(state);
 
+        for (index, action) in ["submitted", "dismissed"].into_iter().enumerate() {
+            let body = REPOSITORY_PAYLOAD.replace("\"opened\"", &format!("\"{action}\""));
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    "pull_request_review",
+                    &format!("delivery-review-{index}"),
+                    body.as_bytes(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "action {action}");
+            let repository = scheduled_rx.try_recv().unwrap();
+            assert_eq!(repository.installation_id, 17);
+            assert_eq!(repository.owner, "dstoc");
+            assert_eq!(repository.name, "merge-app");
+        }
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_pull_request_and_review_actions_do_not_schedule_work() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+
+        for (index, (event, action)) in [
+            ("pull_request", "assigned"),
+            ("pull_request", "labeled"),
+            ("pull_request", "edited"),
+            ("pull_request_review", "edited"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = REPOSITORY_PAYLOAD.replace("\"opened\"", &format!("\"{action}\""));
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    event,
+                    &format!("delivery-irrelevant-{index}"),
+                    body.as_bytes(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_burst_coalesces_through_the_repository_coordinator() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let first_call_gate = Arc::new(Semaphore::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new({
+            let calls = Arc::clone(&calls);
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let first_call_gate = Arc::clone(&first_call_gate);
+            move |_repository: RepositoryLocator| {
+                let calls = Arc::clone(&calls);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let first_call_gate = Arc::clone(&first_call_gate);
+                let started_tx = started_tx.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    started_tx.send(call).unwrap();
+                    if call == 1 {
+                        first_call_gate.acquire().await.unwrap().forget();
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        });
+        let state = Arc::new(WebhookState::new(
+            TEST_SECRET,
+            &[1],
+            move |repository| coordinator.mark_dirty(repository),
+            Arc::new(Notify::new()),
+        ));
+        let app = router(state);
+
         let response = app
+            .clone()
             .oneshot(signed_request(
-                "pull_request_review",
-                "delivery-review",
+                "pull_request",
+                "delivery-burst-0",
                 REPOSITORY_PAYLOAD.as_bytes(),
             ))
             .await
             .unwrap();
-
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let repository = scheduled_rx.try_recv().unwrap();
-        assert_eq!(repository.installation_id, 17);
-        assert_eq!(repository.owner, "dstoc");
-        assert_eq!(repository.name, "merge-app");
-        assert!(scheduled_rx.try_recv().is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let body = REPOSITORY_PAYLOAD.replace("\"opened\"", "\"synchronize\"");
+        for index in 1..=64 {
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    "pull_request",
+                    &format!("delivery-burst-{index}"),
+                    body.as_bytes(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        first_call_gate.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "one event burst should schedule only one follow-up advance"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -579,6 +766,34 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(scheduled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_action_or_repository_identity_is_rejected_without_scheduling() {
+        let (state, mut scheduled_rx) = test_state();
+        let app = router(state);
+        let missing_action = br#"{"installation":{"id":17},"repository":{"name":"merge-app","owner":{"id":1,"login":"dstoc"}}}"#;
+        let missing_repository_identity = br#"{"action":"opened","installation":{"id":17},"repository":{"name":"merge-app","owner":{"login":"dstoc"}}}"#;
+
+        for (index, body) in [
+            missing_action.as_slice(),
+            missing_repository_identity.as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    "pull_request",
+                    &format!("delivery-invalid-shape-{index}"),
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
         assert!(scheduled_rx.try_recv().is_err());
     }
 
