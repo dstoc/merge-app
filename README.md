@@ -26,8 +26,15 @@ The service reads the private key file at startup. It writes structured JSON
 logs to standard error and exits cleanly on SIGINT or SIGTERM. Set `RUST_LOG` to
 change the log filter.
 
-This phase starts the service lifecycle and reconciliation timer. It does not
-make GitHub API calls or start an HTTP server.
+The service verifies its App credentials, then reconciles immediately and every
+`reconcile_interval`. Each pass lists App installations, keeps only accounts in
+`allowed_accounts`, lists their repositories, and marks each repository dirty
+through the work coordinator. Repository workers use repository-scoped
+installation tokens to run the PR queue. Failures for one installation are
+logged and do not stop reconciliation of the other allowlisted installations.
+
+Phase 1 does not use webhooks or start an HTTP server. Periodic reconciliation
+is the mechanism that discovers repository state changes.
 
 ## Manual Phase 0 validation
 

@@ -102,6 +102,37 @@ struct InstallationInfo {
     id: u64,
 }
 
+/// An installation of this GitHub App and the account that owns it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AppInstallation {
+    pub id: u64,
+    pub account: Option<InstallationAccount>,
+}
+
+/// The account that owns an App installation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct InstallationAccount {
+    pub id: u64,
+}
+
+/// A repository accessible to an App installation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct InstallationRepository {
+    pub name: String,
+    pub owner: RepositoryOwner,
+}
+
+/// The owner of a repository returned by the installation repository API.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RepositoryOwner {
+    pub login: String,
+}
+
+#[derive(Deserialize)]
+struct InstallationRepositoriesPage {
+    repositories: Vec<InstallationRepository>,
+}
+
 #[derive(Deserialize)]
 struct InstallationTokenResponse {
     token: String,
@@ -113,7 +144,18 @@ struct InstallationTokenResponse {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct TokenCacheKey {
     installation_id: u64,
-    repository: String,
+    scope: TokenScope,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum TokenScope {
+    AllRepositories,
+    Repository {
+        /// The owner keeps tokens for same-named repositories in separate cache entries.
+        owner: String,
+        /// GitHub expects only this repository name in the token request.
+        name: String,
+    },
 }
 
 struct CachedToken {
@@ -160,6 +202,7 @@ pub struct GitHubAppAuthenticator {
     issuer: String,
     signing_key: EncodingKey,
     client: Client,
+    api_root: String,
     token_cache: Mutex<TokenCache>,
 }
 
@@ -189,6 +232,7 @@ impl GitHubAppAuthenticator {
             issuer: issuer.into(),
             signing_key,
             client,
+            api_root: API_ROOT.to_owned(),
             token_cache: Mutex::new(TokenCache::default()),
         })
     }
@@ -206,7 +250,7 @@ impl GitHubAppAuthenticator {
         let jwt = self.app_jwt()?;
         let response = self
             .client
-            .get(format!("{API_ROOT}/app"))
+            .get(format!("{}/app", self.api_root))
             .bearer_auth(&jwt)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
@@ -243,7 +287,8 @@ impl GitHubAppAuthenticator {
         let response = self
             .client
             .get(format!(
-                "{API_ROOT}/repos/{owner}/{repository}/installation"
+                "{}/repos/{owner}/{repository}/installation",
+                self.api_root
             ))
             .bearer_auth(&jwt)
             .header("Accept", "application/vnd.github+json")
@@ -278,6 +323,128 @@ impl GitHubAppAuthenticator {
         Ok(installation.id)
     }
 
+    /// List every installation of this App, using the App JWT required by GitHub.
+    pub async fn app_installations(&self) -> Result<Vec<AppInstallation>, AuthenticationError> {
+        let mut installations = Vec::new();
+        let mut page = 1_u32;
+
+        loop {
+            let jwt = self.app_jwt()?;
+            let response = self
+                .client
+                .get(format!(
+                    "{}/app/installations?per_page=100&page={page}",
+                    self.api_root
+                ))
+                .bearer_auth(&jwt)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .send()
+                .await
+                .map_err(|error| {
+                    AuthenticationError::AppAuthentication(format!(
+                        "installation list request failed: {error}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                return Err(AuthenticationError::AppAuthentication(
+                    response_error(response, &jwt).await,
+                ));
+            }
+            let page_installations: Vec<AppInstallation> =
+                response.json().await.map_err(|error| {
+                    AuthenticationError::AppAuthentication(format!(
+                        "could not decode App installation list: {error}"
+                    ))
+                })?;
+            let has_next_page = page_installations.len() == 100;
+            installations.extend(page_installations);
+            if !has_next_page {
+                break;
+            }
+            page = page.checked_add(1).ok_or_else(|| {
+                AuthenticationError::AppAuthentication(
+                    "App installation pagination exceeded the supported range".to_owned(),
+                )
+            })?;
+        }
+
+        Ok(installations)
+    }
+
+    /// List all repositories available to an installation.
+    pub async fn installation_repositories(
+        &self,
+        credentials: &InstallationCredentials,
+    ) -> Result<Vec<InstallationRepository>, AuthenticationError> {
+        if credentials.installation_id == 0 {
+            return Err(AuthenticationError::Installation(
+                "installation ID must be greater than zero".to_owned(),
+            ));
+        }
+        if credentials.token.is_empty() {
+            return Err(AuthenticationError::Installation(
+                "installation token must not be empty".to_owned(),
+            ));
+        }
+
+        let mut repositories = Vec::new();
+        let mut page = 1_u32;
+        loop {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/installation/repositories?per_page=100&page={page}",
+                    self.api_root
+                ))
+                .bearer_auth(&credentials.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .send()
+                .await
+                .map_err(|error| {
+                    AuthenticationError::Installation(format!(
+                        "repository list request failed: {error}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                return Err(AuthenticationError::Installation(
+                    response_error(response, &credentials.token).await,
+                ));
+            }
+            let page_repositories: InstallationRepositoriesPage =
+                response.json().await.map_err(|error| {
+                    AuthenticationError::Installation(format!(
+                        "could not decode installation repository list: {error}"
+                    ))
+                })?;
+            let has_next_page = page_repositories.repositories.len() == 100;
+            repositories.extend(page_repositories.repositories);
+            if !has_next_page {
+                break;
+            }
+            page = page.checked_add(1).ok_or_else(|| {
+                AuthenticationError::Installation(
+                    "repository pagination exceeded the supported range".to_owned(),
+                )
+            })?;
+        }
+
+        Ok(repositories)
+    }
+
+    /// Mint a repository-discovery token with no repository permissions.
+    ///
+    /// GitHub grants installation tokens access to all repositories by default.
+    /// An empty permission set keeps this token limited to repository discovery.
+    pub async fn installation_listing_token(
+        &self,
+        installation_id: u64,
+    ) -> Result<InstallationCredentials, AuthenticationError> {
+        self.installation_token_for_scope(installation_id, TokenScope::AllRepositories)
+            .await
+    }
+
     /// Return a cached repository-scoped token or mint one with Pull requests: write.
     pub async fn installation_token(
         &self,
@@ -296,9 +463,30 @@ impl GitHubAppAuthenticator {
             ));
         }
 
+        self.installation_token_for_scope(
+            installation_id,
+            TokenScope::Repository {
+                owner: owner.to_owned(),
+                name: repository.to_owned(),
+            },
+        )
+        .await
+    }
+
+    async fn installation_token_for_scope(
+        &self,
+        installation_id: u64,
+        scope: TokenScope,
+    ) -> Result<InstallationCredentials, AuthenticationError> {
+        if installation_id == 0 {
+            return Err(AuthenticationError::Installation(
+                "installation ID must be greater than zero".to_owned(),
+            ));
+        }
+
         let cache_key = TokenCacheKey {
             installation_id,
-            repository: format!("{owner}/{repository}"),
+            scope: scope.clone(),
         };
         if let Some(credentials) = self
             .token_cache
@@ -310,25 +498,25 @@ impl GitHubAppAuthenticator {
         }
 
         let jwt = self.app_jwt()?;
-        let response = self
+        let mut request = self
             .client
             .post(format!(
-                "{API_ROOT}/app/installations/{installation_id}/access_tokens"
+                "{}/app/installations/{installation_id}/access_tokens",
+                self.api_root
             ))
             .bearer_auth(&jwt)
             .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&json!({
-                "repositories": [repository],
+            .header("X-GitHub-Api-Version", API_VERSION);
+        request = match scope {
+            TokenScope::AllRepositories => request.json(&json!({"permissions": {}})),
+            TokenScope::Repository { name, .. } => request.json(&json!({
+                "repositories": [name],
                 "permissions": {"pull_requests": "write"}
-            }))
-            .send()
-            .await
-            .map_err(|error| {
-                AuthenticationError::Installation(format!(
-                    "installation token request failed: {error}"
-                ))
-            })?;
+            })),
+        };
+        let response = request.send().await.map_err(|error| {
+            AuthenticationError::Installation(format!("installation token request failed: {error}"))
+        })?;
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(AuthenticationError::AppAuthentication(
                 response_error(response, &jwt).await,
@@ -494,7 +682,10 @@ xwIDAQAB\n\
         let expires_at = now + Duration::from_secs(3600);
         let key = TokenCacheKey {
             installation_id: 12,
-            repository: "owner/repo".to_owned(),
+            scope: TokenScope::Repository {
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            },
         };
         let mut cache = TokenCache::default();
         cache.insert(
@@ -515,11 +706,261 @@ xwIDAQAB\n\
                 .get(
                     &TokenCacheKey {
                         installation_id: 12,
-                        repository: "owner/other".to_owned(),
+                        scope: TokenScope::Repository {
+                            owner: "owner".to_owned(),
+                            name: "other".to_owned(),
+                        },
                     },
                     now,
                 )
                 .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    &TokenCacheKey {
+                        installation_id: 12,
+                        scope: TokenScope::Repository {
+                            owner: "other-owner".to_owned(),
+                            name: "repo".to_owned(),
+                        },
+                    },
+                    now,
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_and_repository_discovery_paginate_and_use_a_read_only_listing_token() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        struct Request {
+            target: String,
+            headers: String,
+            body: String,
+        }
+
+        fn read_request(stream: &mut TcpStream) -> Request {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() < header_end + content_length {
+                    continue;
+                }
+
+                let target = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                return Request {
+                    target,
+                    headers,
+                    body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                        .into_owned(),
+                };
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let body = match request.target.as_str() {
+                    "/app/installations?per_page=100&page=1" => serde_json::to_string(
+                        &(1..=100)
+                            .map(|id| json!({"id": id, "account": {"id": 42}}))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
+                    "/app/installations?per_page=100&page=2" => "[]".to_owned(),
+                    "/app/installations/7/access_tokens" => {
+                        r#"{"token":"listing-token","expires_at":"2030-01-01T00:00:00Z","permissions":{}}"#.to_owned()
+                    }
+                    "/installation/repositories?per_page=100&page=1" => {
+                        let repositories = (0..100)
+                            .map(|index| json!({"name": format!("repo-{index}"), "owner": {"login": "owner"}}))
+                            .collect::<Vec<_>>();
+                        serde_json::to_string(&json!({"repositories": repositories})).unwrap()
+                    }
+                    "/installation/repositories?per_page=100&page=2" => serde_json::to_string(
+                        &json!({"repositories": [{"name": "last", "owner": {"login": "owner"}}]}),
+                    )
+                    .unwrap(),
+                    unexpected => panic!("unexpected request target: {unexpected}"),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+
+        let mut authenticator =
+            GitHubAppAuthenticator::new(1, "app-client-id", TEST_PRIVATE_KEY.as_bytes()).unwrap();
+        authenticator.api_root = format!("http://{address}");
+
+        let installations = authenticator.app_installations().await.unwrap();
+        assert_eq!(installations.len(), 100);
+        assert_eq!(installations[0].account.as_ref().unwrap().id, 42);
+
+        let credentials = authenticator.installation_listing_token(7).await.unwrap();
+        assert_eq!(credentials.token, "listing-token");
+        let repositories = authenticator
+            .installation_repositories(&credentials)
+            .await
+            .unwrap();
+        assert_eq!(repositories.len(), 101);
+        assert_eq!(repositories[0].owner.login, "owner");
+        assert_eq!(repositories[100].name, "last");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].target.ends_with("page=1"));
+        assert!(requests[1].target.ends_with("page=2"));
+        assert!(
+            requests[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer ")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&requests[2].body).unwrap(),
+            json!({"permissions": {}})
+        );
+        assert!(
+            requests[3]
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer listing-token")
+        );
+        assert!(requests[3].target.ends_with("page=1"));
+        assert!(requests[4].target.ends_with("page=2"));
+    }
+
+    #[tokio::test]
+    async fn worker_token_uses_repository_name_and_pull_requests_write_permission() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        struct Request {
+            start_line: String,
+            headers: String,
+            body: String,
+        }
+
+        fn read_request(stream: &mut TcpStream) -> Request {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() < header_end + content_length {
+                    continue;
+                }
+
+                let start_line = headers.lines().next().unwrap().to_owned();
+                return Request {
+                    start_line,
+                    headers,
+                    body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                        .into_owned(),
+                };
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let body = r#"{"token":"worker-token","expires_at":"2030-01-01T00:00:00Z","permissions":{"pull_requests":"write"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+
+        let mut authenticator =
+            GitHubAppAuthenticator::new(1, "app-client-id", TEST_PRIVATE_KEY.as_bytes()).unwrap();
+        authenticator.api_root = format!("http://{address}");
+
+        let credentials = authenticator
+            .installation_token(7, "owner", "repo")
+            .await
+            .unwrap();
+        assert_eq!(credentials.token, "worker-token");
+
+        let request = server.join().unwrap();
+        assert_eq!(
+            request.start_line,
+            "POST /app/installations/7/access_tokens HTTP/1.1"
+        );
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer ")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+            json!({
+                "repositories": ["repo"],
+                "permissions": {"pull_requests": "write"}
+            })
         );
     }
 
