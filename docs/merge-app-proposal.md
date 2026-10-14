@@ -1,0 +1,498 @@
+# Merge App — Design Proposal
+
+**Status:** Proposal
+
+## Summary
+
+`merge-app` is a small self-hosted GitHub App that provides a serialized merge queue on top of GitHub native auto-merge.
+
+The app preserves the existing `merge-action` model:
+
+> GitHub owns approvals, required checks, branch protection, auto-merge, and the final merge. `merge-app` only decides which eligible pull request may advance and rebases that pull request onto the latest base branch when required.
+
+Repositories participate by installing the GitHub App and enabling auto-merge on pull requests. The public project is the application binary; how an operator deploys, exposes, and supervises it is intentionally outside the initial project scope.
+
+The design avoids OAuth, per-repository PATs, persistent queue state, Redis, and a database. GitHub remains the source of truth.
+
+## Goals
+
+- Preserve the serialized merge behavior of `merge-action`.
+- Continue using GitHub native auto-merge as the actual merge mechanism.
+- Replace per-repository PATs with GitHub App installation credentials.
+- Support installation by a small allowlisted set of GitHub users or organizations.
+- Request the minimum practical GitHub permissions.
+- Avoid persistent application state where GitHub can remain authoritative.
+- Recover automatically from restarts and missed webhook deliveries.
+- Keep the binary straightforward to self-host.
+
+## Non-goals
+
+The initial version will not:
+
+- merge pull requests directly;
+- enable auto-merge on behalf of users;
+- bypass repository rules;
+- manage CI;
+- create synthetic approvals;
+- provide a general-purpose merge queue configuration language;
+- provide end-user OAuth/login;
+- provide a web dashboard;
+- require a persistent canonical queue;
+- prescribe a particular hosting, ingress, TLS, container, or service-manager setup.
+
+## High-level architecture
+
+```mermaid
+flowchart LR
+    GH[GitHub] -->|webhooks| APP[merge-app]
+    APP -->|App JWT| AUTH[GitHub App API]
+    AUTH -->|installation token| APP
+    APP -->|GraphQL / REST| GH
+    TIMER[Reconciliation timer] --> APP
+```
+
+The application is a single Rust service exposing an HTTP webhook endpoint and running a periodic reconciliation loop.
+
+Webhook events provide low-latency notification that repository state may have changed. GitHub itself remains durable state. Reconciliation repairs missed webhook deliveries or work lost during a restart.
+
+## GitHub App model
+
+The GitHub App is public so that it can be installed on accounts other than the account that owns the App. It does not need to be published in GitHub Marketplace.
+
+User OAuth authorization is not required. Installing a GitHub App grants the App installation access to selected repositories independently of OAuth user authorization.
+
+### Installation allowlist
+
+The service is intended for the maintainer and a small number of explicitly authorized users or organizations.
+
+Configuration stores stable numeric GitHub account IDs rather than usernames:
+
+```toml
+allowed_accounts = [
+    1234567,
+    7654321,
+]
+```
+
+On `installation.created`:
+
+1. Verify the webhook signature.
+2. Inspect `installation.account.id`.
+3. Keep the installation if the account is allowlisted.
+4. Otherwise immediately remove the installation using the GitHub App API.
+
+For an organization installation, authorization applies to the organization account, not the individual person who initiated the installation. GitHub remains responsible for determining which organization members may install Apps.
+
+No application user database or OAuth flow is required for this model.
+
+## Authentication
+
+The service requires:
+
+- GitHub App ID;
+- GitHub App private key;
+- webhook secret.
+
+No OAuth client secret or user token is required.
+
+For repository operations:
+
+```mermaid
+sequenceDiagram
+    participant A as merge-app
+    participant G as GitHub
+
+    A->>A: Sign short-lived App JWT
+    A->>G: Create installation access token
+    G-->>A: Short-lived installation token
+    A->>G: Query/update installed repository
+```
+
+Webhook payloads identify the installation. Installation tokens should be cached in memory until shortly before expiry rather than minted for every API request.
+
+## GitHub permissions
+
+The target permission set is:
+
+| Permission | Access |
+| --- | --- |
+| Repository metadata | Read (implicit) |
+| Pull requests | Read/write |
+
+The App should not request Administration, Actions, or general Contents write permission unless an integration test proves one of them is required.
+
+### Rebase API validation
+
+The current implementation uses:
+
+```text
+gh pr update-branch <PR> --rebase
+```
+
+GitHub CLI implements this through the GraphQL `updatePullRequestBranch` mutation with an expected head OID and the `REBASE` update method.
+
+Before finalizing the permission model, an integration test must prove that a GitHub App installation token with only Pull Requests write can:
+
+1. call `updatePullRequestBranch(updateMethod: REBASE)` successfully;
+2. provide the expected head OID so stale observations cannot update a changed PR;
+3. preserve the pull request's existing auto-merge configuration after the rebase.
+
+If that fails, any permission expansion should be treated as an explicit design decision rather than silently granting Contents write.
+
+## Repository eligibility
+
+A repository is managed when:
+
+- the App is installed for the repository; and
+- its installation account is allowlisted.
+
+No repository-side configuration file is required initially.
+
+Repositories are expected to configure GitHub native auto-merge and branch/ruleset protection appropriately, including required CI and review policy.
+
+## Pull request eligibility
+
+A pull request is a queue candidate when it is:
+
+- open;
+- not a draft;
+- approved according to GitHub's current review state; and
+- configured for GitHub native auto-merge.
+
+The app does not infer whether a PR "should" merge beyond those conditions. Repository rules remain authoritative.
+
+## Event model
+
+Webhook events do not represent durable queue entries. They mean:
+
+> Something changed in this repository; recompute its current state.
+
+Relevant webhook subscriptions include:
+
+- `installation`;
+- `installation_repositories`;
+- `pull_request`;
+- `pull_request_review`.
+
+Relevant pull request changes include:
+
+- auto-merge enabled or disabled;
+- head synchronization;
+- draft/ready state changes;
+- reopened pull requests;
+- closed or merged pull requests.
+
+Relevant review changes include submitted and dismissed reviews.
+
+When the queue head merges, its `pull_request.closed` event causes the repository to be reconsidered and the next candidate may advance.
+
+A direct non-PR change to the base branch may not produce one of these specific events. Periodic reconciliation covers that case.
+
+## Queue algorithm
+
+`advance(repository)` reconstructs queue state entirely from GitHub.
+
+Conceptually:
+
+```text
+eligible =
+    open
+    && !draft
+    && approved
+    && auto_merge_enabled
+
+candidates = eligible PRs ordered oldest-first
+
+for candidate in candidates:
+    if mergeability == CONFLICTING:
+        continue
+
+    if mergeability == UNKNOWN:
+        return
+
+    if candidate is up-to-date:
+        return
+
+    if candidate is behind:
+        rebase candidate onto base
+        return
+```
+
+This intentionally preserves the existing serialized behavior:
+
+- conflicting PRs are skipped;
+- unresolved mergeability prevents a younger PR from overtaking the candidate;
+- only one queue candidate is updated per pass;
+- after a rebase, normal CI and review policy run again;
+- a PR whose required CI fails remains the queue head while it remains eligible;
+- GitHub auto-merge performs the actual merge;
+- a subsequent repository event advances the queue again.
+
+The service does not poll CI to decide when to merge. GitHub's auto-merge machinery remains responsible for waiting for all required checks and rules.
+
+### Race protection
+
+Every rebase should include the observed head SHA/OID as a compare-and-swap condition.
+
+If the PR head changes between observation and mutation, the mutation should fail and the repository should simply be recomputed.
+
+This makes concurrent human activity safe without introducing application-side transactional state.
+
+## Concurrency
+
+Only one `advance()` operation may execute for a repository at a time.
+
+For the initial single-process deployment this can be implemented in memory:
+
+```text
+repository_id -> mutex / repository worker
+```
+
+Webhook bursts should be coalesced rather than creating an unbounded work queue. A suitable model is:
+
+```text
+event
+  -> mark repository dirty
+  -> ensure repository worker scheduled
+  -> worker runs advance()
+  -> if dirtied while running, run again once
+```
+
+This gives each repository serialized execution while allowing unrelated repositories to progress concurrently.
+
+A single-process deployment therefore needs no Redis, database, or distributed lock.
+
+If horizontal scaling is supported later, repository serialization must move to a distributed primitive before multiple service replicas process events concurrently.
+
+## Webhook handling
+
+The service exposes a public HTTP endpoint, for example:
+
+```text
+POST /github/webhook
+```
+
+Processing should be minimal:
+
+1. Read a bounded request body.
+2. Verify `X-Hub-Signature-256` using the webhook secret.
+3. Identify the event and action.
+4. Validate the necessary payload fields.
+5. Mark the affected repository dirty or process installation lifecycle events.
+6. Return promptly.
+
+The application should record `X-GitHub-Delivery` and may maintain a small in-memory LRU of recent delivery IDs to suppress immediate duplicates. Correctness must not depend on deduplication.
+
+Unknown event types should be ignored safely after signature verification.
+
+## Reliability and reconciliation
+
+A durable webhook/event queue is deliberately avoided.
+
+Correctness comes from reconciliation rather than replaying every event.
+
+The service reconciles:
+
+- once at startup;
+- periodically thereafter.
+
+A starting interval of five minutes is reasonable and can be made configurable.
+
+Reconciliation:
+
+1. list active App installations;
+2. remove or ignore unauthorized installations;
+3. enumerate repositories accessible to each authorized installation;
+4. invoke `advance()` for each repository.
+
+Because `advance()` reconstructs state from GitHub, losing in-memory work during a crash does not lose queue state.
+
+The resulting model is:
+
+```text
+webhooks = low-latency trigger
+GitHub = durable state
+reconciliation = repair mechanism
+```
+
+## Configuration
+
+The binary should keep configuration intentionally small. For example:
+
+```toml
+listen = "0.0.0.0:8080"
+reconcile_interval = "5m"
+
+allowed_accounts = [
+    1234567,
+    7654321,
+]
+```
+
+Secrets should be supplied separately from ordinary configuration:
+
+```text
+GITHUB_APP_ID
+GITHUB_APP_PRIVATE_KEY
+GITHUB_WEBHOOK_SECRET
+```
+
+The private key should support being read from a file so deployers can use their preferred secret-management mechanism without placing PEM data directly in configuration.
+
+The project should not prescribe how the binary is exposed to the public internet, where TLS terminates, or whether it runs under Docker, Podman, systemd, Kubernetes, or another environment.
+
+## Observability
+
+Structured logs should include, where applicable:
+
+- installation ID;
+- repository ID and name;
+- pull request number;
+- webhook delivery ID;
+- triggering event;
+- queue decision;
+- observed head/base SHA;
+- resulting head SHA after rebase;
+- GitHub API failures.
+
+Useful decisions include:
+
+```text
+repo=dstoc/example action=no_candidates
+repo=dstoc/example pr=42 action=wait_up_to_date
+repo=dstoc/example pr=43 action=skip_conflict
+repo=dstoc/example pr=44 action=rebase old_head=...
+repo=dstoc/example action=mergeability_pending
+```
+
+No external metrics system is required initially.
+
+A local health endpoint may be provided for deployers, but it is not part of the GitHub protocol.
+
+## Security boundary
+
+The App should not have direct authority to merge a pull request or modify arbitrary repository contents.
+
+The intended credential may:
+
+- inspect PR state;
+- update PR state within the Pull Requests permission;
+- request a server-side PR branch update/rebase.
+
+It should not have:
+
+- repository Contents write;
+- Actions write;
+- Administration permission;
+- branch-protection bypass.
+
+GitHub remains responsible for deciding whether the resulting PR satisfies the repository's rules and may merge.
+
+This retains the useful security property of `merge-action`: compromise of the queue worker should not be equivalent to unrestricted repository write access.
+
+## Migration from merge-action
+
+### Phase 0 — API spike
+
+Create a test GitHub App and prove:
+
+- App JWT authentication;
+- installation-token authentication;
+- PR state queries;
+- GraphQL server-side rebase;
+- Pull Requests write without Contents write;
+- expected-head race protection;
+- preservation of native auto-merge after an App-initiated rebase.
+
+The permission model should not be considered settled until this passes.
+
+### Phase 1 — Core service
+
+Implement:
+
+- App JWT signing;
+- installation-token cache;
+- GitHub API/query layer;
+- the existing queue algorithm;
+- per-repository serialization;
+- reconciliation loop.
+
+Exercise it against test repositories without relying on webhooks.
+
+### Phase 2 — Webhooks and installation lifecycle
+
+Add:
+
+- HMAC validation;
+- installation allowlist enforcement;
+- PR/review event handling;
+- dirty-repository scheduling;
+- delivery logging and lightweight deduplication.
+
+### Phase 3 — Self-hosted release
+
+Publish the Rust binary and/or project-supported container image together with documentation describing:
+
+- required GitHub App settings;
+- required permissions and webhook subscriptions;
+- configuration and secrets;
+- health endpoint, if implemented;
+- requirement for the webhook endpoint to be publicly reachable over HTTPS.
+
+Specific hosting or ingress products remain deployer choices.
+
+### Phase 4 — Parallel validation
+
+Install the App on one repository while retaining the existing Action as a manual fallback.
+
+Do not allow both systems to automatically rebase the same repository concurrently.
+
+Verify event transitions, permission boundaries, restart recovery, and failure cases.
+
+### Phase 5 — Repository migration
+
+For each repository:
+
+1. install the GitHub App and grant repository access;
+2. verify reconciliation sees the repository;
+3. disable/remove the `merge-action` caller workflow;
+4. remove `PR_GH_TOKEN`;
+5. retain existing branch/ruleset protection and GitHub auto-merge settings.
+
+## Future extensions
+
+The architecture leaves room for later additions without requiring them initially:
+
+- optional per-installation or per-repository configuration;
+- queue position/status reporting;
+- status page;
+- configurable ordering or priority labels;
+- pause/resume repository processing;
+- webhook redelivery/recovery tooling;
+- multiple replicas with distributed serialization.
+
+These should only be added when there is a concrete need.
+
+## Decision summary
+
+The proposed service is intentionally a thin hosted version of `merge-action`:
+
+```text
+GitHub webhook
+      ↓
+mark repository dirty
+      ↓
+serialize by repository
+      ↓
+reconstruct queue from GitHub
+      ↓
+rebase at most one PR
+      ↓
+GitHub CI / reviews / auto-merge
+```
+
+The application owns scheduling, not merging.
+
+GitHub remains the durable state store and policy engine. Webhooks provide responsiveness, reconciliation provides reliability, and GitHub App installations provide repository-scoped authentication.
+
+The public project is the binary and its GitHub integration. Deployment architecture is deliberately left to the operator.
