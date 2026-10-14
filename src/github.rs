@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
+use crate::auth::InstallationCredentials;
+
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const PAGE_SIZE: u8 = 100;
 
@@ -194,16 +196,15 @@ impl GitHubQueries {
     pub async fn repository_state(
         &self,
         repository: &RepositoryLocator,
-        token: &str,
+        credentials: &InstallationCredentials,
     ) -> Result<RepositoryState> {
-        repository.validate()?;
-        validate_token(token)?;
+        validate_credentials(repository, credentials)?;
         let mut cursor = None;
         let mut state = None::<RepositoryState>;
 
         loop {
             let page = self
-                .repository_page(repository, token, cursor.as_deref())
+                .repository_page(repository, &credentials.token, cursor.as_deref())
                 .await?;
             let has_next_page = page.page_info.has_next_page;
             let end_cursor = page.page_info.end_cursor.clone();
@@ -243,14 +244,13 @@ impl GitHubQueries {
         &self,
         repository: &RepositoryLocator,
         number: u64,
-        token: &str,
+        credentials: &InstallationCredentials,
     ) -> Result<PullRequestState> {
-        repository.validate()?;
-        validate_token(token)?;
+        validate_credentials(repository, credentials)?;
         let number = i32::try_from(number).context("PR number is too large for GitHub GraphQL")?;
         let response = self
             .graphql_post(
-                token,
+                &credentials.token,
                 PULL_REQUEST_QUERY,
                 json!({
                     "owner": repository.owner,
@@ -518,9 +518,17 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
         .with_context(|| format!("GitHub returned no {field}"))
 }
 
-fn validate_token(token: &str) -> Result<()> {
+fn validate_credentials(
+    repository: &RepositoryLocator,
+    credentials: &InstallationCredentials,
+) -> Result<()> {
+    repository.validate()?;
     ensure!(
-        !token.is_empty(),
+        repository.installation_id == credentials.installation_id,
+        "repository locator installation ID does not match the credentials"
+    );
+    ensure!(
+        !credentials.token.is_empty(),
         "GitHub installation token must not be empty"
     );
     Ok(())
@@ -561,6 +569,15 @@ mod tests {
         GitHubQueries {
             client: Client::new(),
             graphql_url: url,
+        }
+    }
+
+    fn credentials(installation_id: u64) -> InstallationCredentials {
+        InstallationCredentials {
+            installation_id,
+            token: "installation-token".to_owned(),
+            expires_at: "2026-10-14T01:00:00Z".to_owned(),
+            permissions: Default::default(),
         }
     }
 
@@ -630,7 +647,7 @@ mod tests {
         let repository = RepositoryLocator::new(19, "example", "queue").unwrap();
 
         let state = queries
-            .repository_state(&repository, "installation-token")
+            .repository_state(&repository, &credentials(19))
             .await
             .unwrap();
         server.join().unwrap();
@@ -692,7 +709,7 @@ mod tests {
         let repository = RepositoryLocator::new(19, "example", "queue").unwrap();
 
         let pull_request = queries
-            .pull_request_state(&repository, 23, "installation-token")
+            .pull_request_state(&repository, 23, &credentials(19))
             .await
             .unwrap();
         server.join().unwrap();
@@ -729,6 +746,19 @@ mod tests {
         assert!(RepositoryLocator::new(0, "owner", "repo").is_err());
         assert!(RepositoryLocator::new(1, "", "repo").is_err());
         assert!(RepositoryLocator::new(1, "owner", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn queries_reject_credentials_from_another_installation() {
+        let queries = query_client("http://127.0.0.1:1/graphql".to_owned());
+        let repository = RepositoryLocator::new(19, "example", "queue").unwrap();
+
+        let error = queries
+            .repository_state(&repository, &credentials(20))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
     }
 
     fn mock_graphql_server(

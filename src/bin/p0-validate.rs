@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use merge_app::{
-    auth::GitHubAppAuthenticator,
+    auth::{GitHubAppAuthenticator, InstallationCredentials},
     github::{
         GitHubQueries, MergeStateStatus, Mergeability, PullRequestState, PullRequestStatus,
         RepositoryLocator, ReviewDecision,
@@ -79,8 +79,7 @@ async fn run() -> Result<()> {
         args.owner.clone(),
         args.repo.clone(),
     )?;
-    let initial =
-        query_pull_request(&queries, &repository, &installation_token.token, &args).await?;
+    let initial = query_pull_request(&queries, &repository, &installation_token, &args).await?;
     let mut evidence = json!({
         "app_authentication": {
             "get_app_succeeded": true,
@@ -129,8 +128,7 @@ async fn run() -> Result<()> {
             &initial.base_ref_oid,
         )
         .await;
-        let fresh =
-            query_pull_request(&queries, &repository, &installation_token.token, &args).await;
+        let fresh = query_pull_request(&queries, &repository, &installation_token, &args).await;
         let (stale_errors, fresh) = match (stale_probe, fresh) {
             (Ok(result), Ok(fresh)) => (result.errors, fresh),
             (Err(error), _) => {
@@ -184,7 +182,7 @@ async fn run() -> Result<()> {
         let after_rebase = wait_for_head_change(
             &queries,
             &repository,
-            &installation_token.token,
+            &installation_token,
             &args,
             &initial.head_ref_oid,
         )
@@ -228,11 +226,11 @@ async fn run() -> Result<()> {
 async fn query_pull_request(
     queries: &GitHubQueries,
     repository: &RepositoryLocator,
-    token: &str,
+    credentials: &InstallationCredentials,
     args: &Args,
 ) -> Result<PullRequestState> {
     queries
-        .pull_request_state(repository, args.pr_number, token)
+        .pull_request_state(repository, args.pr_number, credentials)
         .await
 }
 
@@ -333,13 +331,13 @@ async fn ensure_success(response: Response, secret: &str) -> Result<Response> {
 async fn wait_for_head_change(
     queries: &GitHubQueries,
     repository: &RepositoryLocator,
-    token: &str,
+    credentials: &InstallationCredentials,
     args: &Args,
     original_head: &str,
 ) -> Result<PullRequestState> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let snapshot = query_pull_request(queries, repository, token, args).await?;
+        let snapshot = query_pull_request(queries, repository, credentials, args).await?;
         if snapshot.head_ref_oid != original_head {
             return Ok(snapshot);
         }
