@@ -1,9 +1,14 @@
 use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use merge_app::auth::GitHubAppAuthenticator;
+use merge_app::{
+    auth::{GitHubAppAuthenticator, InstallationCredentials},
+    github::{
+        GitHubQueries, MergeStateStatus, Mergeability, PullRequestState, PullRequestStatus,
+        RepositoryLocator, ReviewDecision,
+    },
+};
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
@@ -24,28 +29,6 @@ struct Args {
     repo: String,
     pr_number: u64,
     execute_rebase: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PullRequest {
-    id: String,
-    number: u64,
-    state: String,
-    is_draft: bool,
-    review_decision: Option<String>,
-    mergeable: String,
-    merge_state_status: String,
-    head_ref_oid: String,
-    base_ref_oid: String,
-    auto_merge_request: Option<AutoMergeRequest>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AutoMergeRequest {
-    enabled_at: String,
-    merge_method: String,
 }
 
 #[derive(Debug)]
@@ -90,7 +73,13 @@ async fn run() -> Result<()> {
         .await?;
     validate_permissions(&installation_token.permissions, "installation token")?;
 
-    let initial = query_pull_request(&client, &installation_token.token, &args).await?;
+    let queries = GitHubQueries::new(client.clone());
+    let repository = RepositoryLocator::new(
+        installation_token.installation_id,
+        args.owner.clone(),
+        args.repo.clone(),
+    )?;
+    let initial = query_pull_request(&queries, &repository, &installation_token, &args).await?;
     let mut evidence = json!({
         "app_authentication": {
             "get_app_succeeded": true,
@@ -135,11 +124,11 @@ async fn run() -> Result<()> {
         let stale_probe = update_pull_request_branch_raw(
             &client,
             &installation_token.token,
-            &initial.id,
+            initial.id.as_str(),
             &initial.base_ref_oid,
         )
         .await;
-        let fresh = query_pull_request(&client, &installation_token.token, &args).await;
+        let fresh = query_pull_request(&queries, &repository, &installation_token, &args).await;
         let (stale_errors, fresh) = match (stale_probe, fresh) {
             (Ok(result), Ok(fresh)) => (result.errors, fresh),
             (Err(error), _) => {
@@ -157,7 +146,7 @@ async fn run() -> Result<()> {
         };
         let expected_head_rejected = is_expected_head_mismatch(&stale_errors);
         let head_unchanged = fresh.head_ref_oid == initial.head_ref_oid;
-        let still_behind = fresh.merge_state_status == "BEHIND";
+        let still_behind = fresh.merge_state_status == MergeStateStatus::Behind;
         let automerge_preserved = fresh.auto_merge_request.is_some();
         let stale_probe_evidence = json!({
             "mismatched_expected_head_oid": initial.base_ref_oid,
@@ -180,7 +169,7 @@ async fn run() -> Result<()> {
         let rebase = update_pull_request_branch(
             &client,
             &installation_token.token,
-            &initial.id,
+            initial.id.as_str(),
             &initial.head_ref_oid,
         )
         .await;
@@ -191,8 +180,9 @@ async fn run() -> Result<()> {
         }
 
         let after_rebase = wait_for_head_change(
-            &client,
-            &installation_token.token,
+            &queries,
+            &repository,
+            &installation_token,
             &args,
             &initial.head_ref_oid,
         )
@@ -233,27 +223,15 @@ async fn run() -> Result<()> {
     print_evidence(&evidence)
 }
 
-async fn query_pull_request(client: &Client, token: &str, args: &Args) -> Result<PullRequest> {
-    const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id number state isDraft reviewDecision mergeable mergeStateStatus headRefOid baseRefOid autoMergeRequest { enabledAt mergeMethod } } } }";
-    let number = i32::try_from(args.pr_number).context("PR number is too large")?;
-    let response = graphql_post(
-        client,
-        token,
-        QUERY,
-        json!({"owner": args.owner, "repo": args.repo, "number": number}),
-    )
-    .await?;
-    ensure!(
-        response.errors.is_empty(),
-        "pull request query failed: {}",
-        response.errors.join("; ")
-    );
-    let pull_request = &response.data["repository"]["pullRequest"];
-    ensure!(
-        !pull_request.is_null(),
-        "GitHub did not return the requested pull request"
-    );
-    serde_json::from_value(pull_request.clone()).context("could not decode pull request snapshot")
+async fn query_pull_request(
+    queries: &GitHubQueries,
+    repository: &RepositoryLocator,
+    credentials: &InstallationCredentials,
+    args: &Args,
+) -> Result<PullRequestState> {
+    queries
+        .pull_request_state(repository, args.pr_number, credentials)
+        .await
 }
 
 async fn update_pull_request_branch(
@@ -351,14 +329,15 @@ async fn ensure_success(response: Response, secret: &str) -> Result<Response> {
 }
 
 async fn wait_for_head_change(
-    client: &Client,
-    token: &str,
+    queries: &GitHubQueries,
+    repository: &RepositoryLocator,
+    credentials: &InstallationCredentials,
     args: &Args,
     original_head: &str,
-) -> Result<PullRequest> {
+) -> Result<PullRequestState> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let snapshot = query_pull_request(client, token, args).await?;
+        let snapshot = query_pull_request(queries, repository, credentials, args).await?;
         if snapshot.head_ref_oid != original_head {
             return Ok(snapshot);
         }
@@ -371,9 +350,9 @@ async fn wait_for_head_change(
     }
 }
 
-fn validate_rebase_target(pull_request: &PullRequest) -> Result<()> {
+fn validate_rebase_target(pull_request: &PullRequestState) -> Result<()> {
     ensure!(
-        pull_request.state == "OPEN",
+        pull_request.state == PullRequestStatus::Open,
         "the pull request must be open"
     );
     ensure!(
@@ -381,7 +360,7 @@ fn validate_rebase_target(pull_request: &PullRequest) -> Result<()> {
         "the pull request must not be a draft"
     );
     ensure!(
-        pull_request.review_decision.as_deref() == Some("APPROVED"),
+        pull_request.review_decision == ReviewDecision::Approved,
         "the pull request must have reviewDecision APPROVED"
     );
     ensure!(
@@ -389,11 +368,11 @@ fn validate_rebase_target(pull_request: &PullRequest) -> Result<()> {
         "native auto-merge must already be enabled on the pull request"
     );
     ensure!(
-        pull_request.mergeable == "MERGEABLE",
+        pull_request.mergeability == Mergeability::Mergeable,
         "the pull request must have mergeable state MERGEABLE"
     );
     ensure!(
-        pull_request.merge_state_status == "BEHIND",
+        pull_request.merge_state_status == MergeStateStatus::Behind,
         "the pull request must have mergeStateStatus BEHIND"
     );
     ensure!(
@@ -607,41 +586,45 @@ mod tests {
 
     #[test]
     fn rebase_requires_a_suitable_test_pull_request() {
-        let pull_request = PullRequest {
-            id: "PR_kwDO-test".to_owned(),
+        use merge_app::github::{MergeMethod, PullRequestId};
+
+        let pull_request = PullRequestState {
+            id: PullRequestId("PR_kwDO-test".to_owned()),
             number: 42,
-            state: "OPEN".to_owned(),
+            created_at: "2026-10-14T00:00:00Z".to_owned(),
+            state: PullRequestStatus::Open,
             is_draft: false,
-            review_decision: Some("APPROVED".to_owned()),
-            mergeable: "MERGEABLE".to_owned(),
-            merge_state_status: "BEHIND".to_owned(),
+            review_decision: ReviewDecision::Approved,
+            mergeability: Mergeability::Mergeable,
+            merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: "head-before".to_owned(),
             base_ref_oid: "base".to_owned(),
-            auto_merge_request: Some(AutoMergeRequest {
+            auto_merge_request: Some(merge_app::github::AutoMergeRequest {
                 enabled_at: "2026-10-14T00:00:00Z".to_owned(),
-                merge_method: "SQUASH".to_owned(),
+                merge_method: MergeMethod::Squash,
             }),
         };
 
         assert!(validate_rebase_target(&pull_request).is_ok());
 
         let mut ineligible = pull_request;
-        ineligible.merge_state_status = "CLEAN".to_owned();
+        ineligible.merge_state_status = MergeStateStatus::Clean;
         assert!(validate_rebase_target(&ineligible).is_err());
 
-        let ineligible = PullRequest {
-            id: "PR_kwDO-test".to_owned(),
+        let ineligible = PullRequestState {
+            id: PullRequestId("PR_kwDO-test".to_owned()),
             number: 42,
-            state: "OPEN".to_owned(),
+            created_at: "2026-10-14T00:00:00Z".to_owned(),
+            state: PullRequestStatus::Open,
             is_draft: false,
-            review_decision: Some("APPROVED".to_owned()),
-            mergeable: "CONFLICTING".to_owned(),
-            merge_state_status: "BEHIND".to_owned(),
+            review_decision: ReviewDecision::Approved,
+            mergeability: Mergeability::Conflicting,
+            merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: "head-before".to_owned(),
             base_ref_oid: "base".to_owned(),
-            auto_merge_request: Some(AutoMergeRequest {
+            auto_merge_request: Some(merge_app::github::AutoMergeRequest {
                 enabled_at: "2026-10-14T00:00:00Z".to_owned(),
-                merge_method: "SQUASH".to_owned(),
+                merge_method: MergeMethod::Squash,
             }),
         };
         assert!(validate_rebase_target(&ineligible).is_err());
