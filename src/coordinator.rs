@@ -43,10 +43,37 @@ struct CoordinatorState {
     scheduling_epoch: u64,
 }
 
+impl CoordinatorState {
+    fn is_blocked(&self, key: &RepositoryKey) -> bool {
+        self.blocked_installations.contains(&key.installation_id)
+            || self
+                .installations_requiring_repository_refresh
+                .contains(&key.installation_id)
+            || self.blocked_repositories.contains(key)
+    }
+
+    fn mark_dirty(&mut self, key: &RepositoryKey) -> bool {
+        let start_worker = match self.repositories.get_mut(key) {
+            Some(dirty) => {
+                *dirty = true;
+                false
+            }
+            None => {
+                self.repositories.insert(key.clone(), true);
+                true
+            }
+        };
+        self.known_repositories
+            .entry(key.installation_id)
+            .or_default()
+            .insert(key.clone());
+        start_worker
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingRetry {
     generation: u64,
-    expected_epoch: u64,
     deadline: Instant,
     reason: RetryReason,
     stage: Option<u8>,
@@ -157,31 +184,33 @@ impl<F> RepositoryWorkCoordinator<F> {
         Fut: Future + Send + 'static,
         Fut::Output: IntoWorkerDirective,
     {
-        self.mark_dirty_at_epoch_inner(repository, expected_epoch, None)
+        let runtime = tokio::runtime::Handle::try_current()
+            .context("repository work must be scheduled from a Tokio runtime")?;
+        let key = RepositoryKey::from(&repository);
+
+        let start_worker = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("repository coordinator lock poisoned");
+            if state.scheduling_epoch != expected_epoch || state.is_blocked(&key) {
+                return Ok(false);
+            }
+            state.pending_retries.remove(&key);
+            state.mark_dirty(&key)
+        };
+
+        if start_worker {
+            runtime.spawn(run_worker(Arc::clone(&self.inner), key, repository));
+        }
+        Ok(true)
     }
 
     fn mark_retry_dirty<Fut>(
         &self,
         repository: RepositoryLocator,
         pending_retry: PendingRetry,
-    ) -> Result<bool>
-    where
-        F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
-        Fut: Future + Send + 'static,
-        Fut::Output: IntoWorkerDirective,
-    {
-        self.mark_dirty_at_epoch_inner(
-            repository,
-            pending_retry.expected_epoch,
-            Some(pending_retry),
-        )
-    }
-
-    fn mark_dirty_at_epoch_inner<Fut>(
-        &self,
-        repository: RepositoryLocator,
-        expected_epoch: u64,
-        expected_retry: Option<PendingRetry>,
     ) -> Result<bool>
     where
         F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
@@ -198,37 +227,14 @@ impl<F> RepositoryWorkCoordinator<F> {
                 .state
                 .lock()
                 .expect("repository coordinator lock poisoned");
-            if state.scheduling_epoch != expected_epoch
-                || state.blocked_installations.contains(&key.installation_id)
-                || state
-                    .installations_requiring_repository_refresh
-                    .contains(&key.installation_id)
-                || state.blocked_repositories.contains(&key)
-            {
-                return Ok(false);
-            }
-            if let Some(expected_retry) = expected_retry
-                && state.pending_retries.get(&key) != Some(&expected_retry)
-            {
+            if state.pending_retries.get(&key) != Some(&pending_retry) {
                 return Ok(false);
             }
             state.pending_retries.remove(&key);
-            let start_worker = match state.repositories.get_mut(&key) {
-                Some(dirty) => {
-                    *dirty = true;
-                    false
-                }
-                None => {
-                    state.repositories.insert(key.clone(), true);
-                    true
-                }
-            };
-            state
-                .known_repositories
-                .entry(key.installation_id)
-                .or_default()
-                .insert(key.clone());
-            start_worker
+            if state.is_blocked(&key) {
+                return Ok(false);
+            }
+            state.mark_dirty(&key)
         };
 
         if start_worker {
@@ -402,11 +408,7 @@ async fn run_worker<F, Fut>(
                 .state
                 .lock()
                 .expect("repository coordinator lock poisoned");
-            let blocked = state.blocked_installations.contains(&key.installation_id)
-                || state
-                    .installations_requiring_repository_refresh
-                    .contains(&key.installation_id)
-                || state.blocked_repositories.contains(&key);
+            let blocked = state.is_blocked(&key);
             if blocked {
                 state.repositories.remove(&key);
                 false
@@ -488,13 +490,7 @@ fn schedule_retry<F, Fut>(
             .state
             .lock()
             .expect("repository coordinator lock poisoned");
-        if state.blocked_installations.contains(&key.installation_id)
-            || state
-                .installations_requiring_repository_refresh
-                .contains(&key.installation_id)
-            || state.blocked_repositories.contains(&key)
-            || state.repositories.get(&key).copied().unwrap_or(false)
-        {
+        if state.is_blocked(&key) || state.repositories.get(&key).copied().unwrap_or(false) {
             return;
         }
 
@@ -543,7 +539,6 @@ fn schedule_retry<F, Fut>(
         state.next_retry_generation = state.next_retry_generation.wrapping_add(1);
         let pending_retry = PendingRetry {
             generation: state.next_retry_generation,
-            expected_epoch: state.scheduling_epoch,
             deadline,
             reason,
             stage,
@@ -1215,6 +1210,98 @@ mod tests {
         }
         assert_eq!(wait_for_call(&mut call_rx).await, 5);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(
+            coordinator
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .pending_retries
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_lifecycle_changes_do_not_discard_pending_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (call_tx, mut call_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new({
+            let calls = Arc::clone(&calls);
+            move |_repository: RepositoryLocator| {
+                let calls = Arc::clone(&calls);
+                let call_tx = call_tx.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    call_tx.send(call).unwrap();
+                    if call == 1 {
+                        Ok(WorkerDirective::Retry(RetryReason::MergeabilityUnknown))
+                    } else {
+                        Ok(WorkerDirective::Complete)
+                    }
+                }
+            }
+        });
+
+        let repository_a = RepositoryLocator::new(1, "owner", "repo-a").unwrap();
+        let repository_b = RepositoryLocator::new(2, "owner", "repo-b").unwrap();
+        let repository_c = RepositoryLocator::new(1, "owner", "repo-c").unwrap();
+
+        coordinator.mark_dirty(repository_a.clone()).unwrap();
+        assert_eq!(wait_for_call(&mut call_rx).await, 1);
+        wait_for_pending_retry(&coordinator, &repository_a).await;
+
+        // Lifecycle changes for an unrelated repository/installation and for another
+        // repository in the same installation must not discard repository A's retry.
+        coordinator.block_repository(&repository_b);
+        coordinator.block_installation(2);
+        coordinator.block_repository(&repository_c);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(wait_for_call(&mut call_rx).await, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            coordinator
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .pending_retries
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unblocking_does_not_revive_superseded_retry_timer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (call_tx, mut call_rx) = mpsc::unbounded_channel();
+        let coordinator = RepositoryWorkCoordinator::new({
+            let calls = Arc::clone(&calls);
+            move |_repository: RepositoryLocator| {
+                let calls = Arc::clone(&calls);
+                let call_tx = call_tx.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    call_tx.send(call).unwrap();
+                    Ok(WorkerDirective::Retry(RetryReason::MergeabilityUnknown))
+                }
+            }
+        });
+
+        let repository = repository("unblock-revival-check");
+        coordinator.mark_dirty(repository.clone()).unwrap();
+        assert_eq!(wait_for_call(&mut call_rx).await, 1);
+        wait_for_pending_retry(&coordinator, &repository).await;
+
+        // Block and then unblock the repository before the timer expires.
+        coordinator.block_repository(&repository);
+        coordinator.unblock_repository(&repository);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(call_rx.try_recv().is_err());
         assert!(
             coordinator
                 .inner
