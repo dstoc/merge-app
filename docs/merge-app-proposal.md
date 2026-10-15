@@ -190,7 +190,8 @@ advance.
 
 Workers query GitHub for current queue state after a dirty signal. GitHub's
 `reviewDecision` remains authoritative; webhook payloads do not supply queue state
-or mutation instructions. Periodic reconciliation covers missed webhook deliveries.
+or mutation instructions. The full periodic reconciliation repairs missed webhook
+deliveries and interrupted work.
 
 ## Queue algorithm
 
@@ -295,14 +296,18 @@ Unknown event types should be ignored safely after signature verification.
 
 A durable webhook/event queue is deliberately avoided.
 
-Correctness comes from reconciliation rather than replaying every event.
+GitHub is the durable state store. Workers reconstruct queue state from GitHub
+when work is scheduled, so the service does not need to replay every event.
 
-The service reconciles:
+The service runs a full reconciliation:
 
-- once at startup;
-- periodically thereafter.
+- immediately at startup to reconstruct state after a restart;
+- immediately when an installation lifecycle webhook reports an access change;
+- every `reconcile_interval` as a safety sweep.
 
-A starting interval of five minutes is reasonable and can be made configurable.
+The periodic interval defaults to one hour and remains configurable. This is a
+safety interval, not an SLA for normal queue progress. Repository webhooks are
+the normal low-latency trigger. Targeted retries recover transient queue states.
 
 Reconciliation:
 
@@ -316,9 +321,11 @@ Because `advance()` reconstructs state from GitHub, losing in-memory work during
 The resulting model is:
 
 ```text
-webhooks = low-latency trigger
+webhooks = normal low-latency queue trigger
+targeted retries = transient-state recovery
 GitHub = durable state
-reconciliation = repair mechanism
+startup reconciliation = restart reconstruction
+periodic reconciliation = missed-event and lifecycle repair
 ```
 
 ## Configuration
@@ -327,7 +334,7 @@ The binary should keep configuration intentionally small. For example:
 
 ```toml
 listen = "0.0.0.0:8080"
-reconcile_interval = "5m"
+reconcile_interval = "1h"
 
 allowed_accounts = [
     1234567,

@@ -8,14 +8,15 @@
 Create `merge-app.toml` in the working directory:
 
 ```toml
-reconcile_interval = "5m"
+reconcile_interval = "1h"
 webhook_listen_addr = "127.0.0.1:8080"
 allowed_accounts = [1234567, 7654321]
 ```
 
-`reconcile_interval` defaults to `5m`. Set `MERGE_APP_CONFIG` to use a different
-configuration file. Supply the App ID and private key path through the
-environment:
+`reconcile_interval` defaults to `1h`. It controls the periodic safety
+reconciliation. Set a different value for diagnostics or use `MERGE_APP_CONFIG`
+to select another configuration file. Supply the App ID and private key path
+through the environment:
 
 ```sh
 export GITHUB_APP_ID=123456
@@ -32,12 +33,14 @@ bodies larger than 1,000,000 bytes before it parses an event. It writes
 structured JSON logs to standard error and exits cleanly on SIGINT or SIGTERM.
 Set `RUST_LOG` to change the log filter.
 
-The service verifies its App credentials, then reconciles immediately and every
-`reconcile_interval`. Each pass lists App installations, keeps only accounts in
-`allowed_accounts`, lists their repositories, and marks each repository dirty
-through the work coordinator. Repository workers use repository-scoped
-installation tokens to run the PR queue. Failures for one installation are
-logged and do not stop reconciliation of the other allowlisted installations.
+The service verifies its App credentials, then runs a full reconciliation at
+startup and on the `reconcile_interval` timer. Installation lifecycle webhooks
+also request an immediate full reconciliation so access changes do not wait for
+the timer. Each pass lists App installations, enforces `allowed_accounts`,
+retries unauthorized installation removal, lists accessible repositories, and
+marks each discovered repository dirty through the work coordinator. Failures
+for one installation are logged and do not stop reconciliation of the other
+allowlisted installations.
 
 Subscribe the GitHub App to these webhook events:
 
@@ -51,10 +54,13 @@ Installation events request an immediate reconciliation. Every valid pull reques
 review, or push event for an authorized repository marks that repository dirty,
 regardless of the event action. These events are broad signals that repository state
 may have changed. They do not imply that the worker will mutate a pull request.
-Workers query GitHub for current queue state, including its authoritative
-`reviewDecision`, before they decide whether to advance the queue. The coordinator
-coalesces bursts for each repository. Periodic reconciliation remains the recovery
-path for missed webhook deliveries.
+These webhooks are the normal low-latency queue trigger. Targeted retries recover
+transient queue states. Workers query GitHub, the durable state store, for current
+queue state, including its authoritative `reviewDecision`, before they decide
+whether to advance the queue. The coordinator coalesces bursts for each
+repository. The full periodic reconciliation repairs missed events, interrupted
+work, and lifecycle state. Its one-hour default is a safety interval, not an SLA
+for normal queue progress.
 
 ## Manual Phase 0 validation
 

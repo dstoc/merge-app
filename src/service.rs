@@ -82,6 +82,23 @@ trait Reconciler {
     async fn reconcile(&self) -> Result<usize>;
 }
 
+#[derive(Clone, Copy)]
+enum ReconciliationTrigger {
+    Startup,
+    Periodic,
+    WebhookLifecycle,
+}
+
+impl ReconciliationTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Periodic => "periodic",
+            Self::WebhookLifecycle => "webhook_lifecycle",
+        }
+    }
+}
+
 struct ServiceReconciler<F> {
     authenticator: Arc<GitHubAppAuthenticator>,
     allowed_accounts: Vec<u64>,
@@ -395,7 +412,7 @@ where
         biased;
         reason = &mut shutdown => reason?,
         result = reconciler.reconcile() => {
-            log_reconciliation(result);
+            log_reconciliation(ReconciliationTrigger::Startup, result);
             loop {
                 tokio::select! {
                     biased;
@@ -406,7 +423,7 @@ where
                             reason = &mut shutdown => break reason?,
                             result = reconciler.reconcile() => result,
                         };
-                        log_reconciliation(result);
+                        log_reconciliation(ReconciliationTrigger::WebhookLifecycle, result);
                     }
                     _ = ticker.tick() => {
                         let result = tokio::select! {
@@ -414,7 +431,7 @@ where
                             reason = &mut shutdown => break reason?,
                             result = reconciler.reconcile() => result,
                         };
-                        log_reconciliation(result);
+                        log_reconciliation(ReconciliationTrigger::Periodic, result);
                     }
                 }
             }
@@ -426,13 +443,21 @@ where
     Ok(())
 }
 
-fn log_reconciliation(result: Result<usize>) {
+fn log_reconciliation(trigger: ReconciliationTrigger, result: Result<usize>) {
     match result {
         Ok(repository_count) => {
-            info!(event = "reconciliation_pass_completed", repository_count);
+            info!(
+                event = "reconciliation_pass_completed",
+                trigger = trigger.as_str(),
+                repository_count
+            );
         }
         Err(reconciliation_error) => {
-            error!(event = "reconciliation_pass_failed", error = %reconciliation_error);
+            error!(
+                event = "reconciliation_pass_failed",
+                trigger = trigger.as_str(),
+                error = %reconciliation_error
+            );
         }
     }
 }
@@ -465,17 +490,20 @@ async fn shutdown_signal() -> Result<&'static str> {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
+        io,
         sync::{
-            Mutex,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use tokio::{
-        sync::{Notify, mpsc},
-        time::timeout,
+        sync::{Notify, mpsc, oneshot},
+        time::{advance, timeout},
     };
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::auth::{InstallationAccount, RepositoryOwner};
@@ -873,50 +901,170 @@ mod tests {
 
     struct CountingReconciler {
         calls: AtomicUsize,
-        shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        call_tx: mpsc::UnboundedSender<usize>,
     }
 
     impl Reconciler for CountingReconciler {
         async fn reconcile(&self) -> Result<usize> {
             let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if calls == 3 {
-                self.shutdown
+            self.call_tx.send(calls).unwrap();
+            Ok(0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogBuffer {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn service_reconciles_immediately_on_startup_and_lifecycle_and_on_timer() {
+        let interval = Duration::from_secs(60);
+        let (call_tx, mut call_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let reconcile_signal = Arc::new(Notify::new());
+        let log_buffer = SharedLogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(log_buffer.clone())
+            .finish();
+        let reconciler = Arc::new(CountingReconciler {
+            calls: AtomicUsize::new(0),
+            call_tx,
+        });
+
+        let service_task = tokio::spawn({
+            let reconciler = Arc::clone(&reconciler);
+            let reconcile_signal = Arc::clone(&reconcile_signal);
+            async move {
+                run_until(
+                    1,
+                    0,
+                    interval,
+                    reconciler.as_ref(),
+                    reconcile_signal.as_ref(),
+                    async move {
+                        shutdown_rx
+                            .await
+                            .map(|()| "test signal")
+                            .map_err(anyhow::Error::from)
+                    },
+                )
+                .with_subscriber(subscriber)
+                .await
+            }
+        });
+
+        assert_eq!(call_rx.recv().await, Some(1));
+        assert_eq!(reconciler.calls.load(Ordering::SeqCst), 1);
+
+        advance(interval - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reconciler.calls.load(Ordering::SeqCst), 1);
+
+        reconcile_signal.notify_one();
+        assert_eq!(call_rx.recv().await, Some(2));
+
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(call_rx.recv().await, Some(3));
+
+        shutdown_tx.send(()).unwrap();
+        service_task.await.unwrap().unwrap();
+
+        let logs = String::from_utf8(log_buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("trigger=\"startup\""));
+        assert!(logs.contains("trigger=\"webhook_lifecycle\""));
+        assert!(logs.contains("trigger=\"periodic\""));
+    }
+
+    struct StartupGateReconciler {
+        calls: AtomicUsize,
+        call_tx: mpsc::UnboundedSender<usize>,
+        gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl Reconciler for StartupGateReconciler {
+        async fn reconcile(&self) -> Result<usize> {
+            let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.call_tx.send(calls).unwrap();
+            if calls == 1 {
+                self.gate
                     .lock()
-                    .unwrap()
+                    .await
                     .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
+                    .expect("startup gate is present")
+                    .await?;
             }
             Ok(0)
         }
     }
 
-    #[tokio::test]
-    async fn service_reconciles_on_startup_and_on_the_periodic_timer() {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let reconciler = CountingReconciler {
+    #[tokio::test(start_paused = true)]
+    async fn missed_periodic_ticks_are_delayed_without_a_catch_up_burst() {
+        let interval = Duration::from_secs(60);
+        let (call_tx, mut call_rx) = mpsc::unbounded_channel();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let reconcile_signal = Arc::new(Notify::new());
+        let reconciler = Arc::new(StartupGateReconciler {
             calls: AtomicUsize::new(0),
-            shutdown: Mutex::new(Some(shutdown_tx)),
-        };
+            call_tx,
+            gate: tokio::sync::Mutex::new(Some(gate_rx)),
+        });
 
-        run_until(
-            1,
-            0,
-            Duration::from_millis(1),
-            &reconciler,
-            &Notify::new(),
+        let service_task = tokio::spawn({
+            let reconciler = Arc::clone(&reconciler);
+            let reconcile_signal = Arc::clone(&reconcile_signal);
             async move {
-                shutdown_rx
-                    .await
-                    .map(|()| "test signal")
-                    .map_err(anyhow::Error::from)
-            },
-        )
-        .await
-        .unwrap();
+                run_until(
+                    1,
+                    0,
+                    interval,
+                    reconciler.as_ref(),
+                    reconcile_signal.as_ref(),
+                    async move {
+                        shutdown_rx
+                            .await
+                            .map(|()| "test signal")
+                            .map_err(anyhow::Error::from)
+                    },
+                )
+                .await
+            }
+        });
 
-        assert_eq!(reconciler.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(call_rx.recv().await, Some(1));
+        advance(interval * 5).await;
+        gate_tx.send(()).unwrap();
+        assert_eq!(call_rx.recv().await, Some(2));
+
+        advance(interval - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reconciler.calls.load(Ordering::SeqCst), 2);
+
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(call_rx.recv().await, Some(3));
+        shutdown_tx.send(()).unwrap();
+        service_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
