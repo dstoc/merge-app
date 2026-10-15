@@ -9,8 +9,10 @@ use crate::{
         AppInstallation, GitHubAppAuthenticator, InstallationCredentials, InstallationRepository,
     },
     config::AppConfig,
-    coordinator::RepositoryWorkCoordinator,
+    coordinator::{IntoWorkerDirective, RepositoryWorkCoordinator, RetryReason, WorkerDirective},
     github::RepositoryLocator,
+    pull_request::RebaseOutcome,
+    queue::{AdvanceOutcome, WaitingReason},
     webhook::{self, LifecycleChange, WebhookState},
 };
 
@@ -89,7 +91,8 @@ struct ServiceReconciler<F> {
 impl<F, Fut> Reconciler for ServiceReconciler<F>
 where
     F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<()>> + Send + 'static,
+    Fut: Future + Send + 'static,
+    Fut::Output: IntoWorkerDirective,
 {
     async fn reconcile(&self) -> Result<usize> {
         reconcile_once(
@@ -135,7 +138,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 repository = %format!("{}/{}", repository.owner, repository.name),
                 ?outcome,
             );
-            Ok(())
+            Ok(worker_directive_for_outcome(&outcome))
         }
     });
     let reconciler = ServiceReconciler {
@@ -225,7 +228,8 @@ async fn reconcile_once<S, F, Fut>(
 where
     S: InstallationDiscovery,
     F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<()>> + Send + 'static,
+    Fut: Future + Send + 'static,
+    Fut::Output: IntoWorkerDirective,
 {
     let scheduling_epoch = coordinator.scheduling_epoch();
     let installations = source
@@ -343,6 +347,26 @@ where
         repository_count = marked_repositories
     );
     Ok(marked_repositories)
+}
+
+fn worker_directive_for_outcome(outcome: &AdvanceOutcome) -> WorkerDirective {
+    match outcome {
+        AdvanceOutcome::Waiting {
+            reason: WaitingReason::MergeabilityUnknown,
+            ..
+        } => WorkerDirective::Retry(RetryReason::MergeabilityUnknown),
+        AdvanceOutcome::Waiting {
+            reason: WaitingReason::BaseRelationshipUnknown,
+            ..
+        } => WorkerDirective::Retry(RetryReason::BaseRelationshipUnknown),
+        AdvanceOutcome::RebaseAttempted {
+            outcome: RebaseOutcome::StaleHead { .. },
+            ..
+        } => WorkerDirective::Retry(RetryReason::StaleHead),
+        AdvanceOutcome::NoActionablePullRequests
+        | AdvanceOutcome::AlreadyCurrent { .. }
+        | AdvanceOutcome::RebaseAttempted { .. } => WorkerDirective::Complete,
+    }
 }
 
 async fn run_until<R, F>(
@@ -531,7 +555,8 @@ mod tests {
     impl<F, Fut> Reconciler for DiscoveryReconciler<'_, F>
     where
         F: Fn(RepositoryLocator) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        Fut: Future + Send + 'static,
+        Fut::Output: IntoWorkerDirective,
     {
         async fn reconcile(&self) -> Result<usize> {
             reconcile_once(self.discovery, self.allowed_accounts, self.coordinator).await
@@ -551,6 +576,55 @@ mod tests {
             owner: RepositoryOwner {
                 login: owner.to_owned(),
             },
+        }
+    }
+
+    #[test]
+    fn queue_outcomes_retry_only_transient_states_and_stale_heads() {
+        assert_eq!(
+            worker_directive_for_outcome(&AdvanceOutcome::Waiting {
+                pull_request_number: 1,
+                reason: WaitingReason::MergeabilityUnknown,
+            }),
+            WorkerDirective::Retry(RetryReason::MergeabilityUnknown)
+        );
+        assert_eq!(
+            worker_directive_for_outcome(&AdvanceOutcome::Waiting {
+                pull_request_number: 1,
+                reason: WaitingReason::BaseRelationshipUnknown,
+            }),
+            WorkerDirective::Retry(RetryReason::BaseRelationshipUnknown)
+        );
+        assert_eq!(
+            worker_directive_for_outcome(&AdvanceOutcome::RebaseAttempted {
+                pull_request_number: 1,
+                outcome: RebaseOutcome::StaleHead {
+                    message: "head changed".to_owned(),
+                },
+            }),
+            WorkerDirective::Retry(RetryReason::StaleHead)
+        );
+
+        for stable in [
+            AdvanceOutcome::NoActionablePullRequests,
+            AdvanceOutcome::AlreadyCurrent {
+                pull_request_number: 1,
+            },
+            AdvanceOutcome::RebaseAttempted {
+                pull_request_number: 1,
+                outcome: RebaseOutcome::Rebased,
+            },
+            AdvanceOutcome::RebaseAttempted {
+                pull_request_number: 1,
+                outcome: RebaseOutcome::Conflict {
+                    message: "conflict".to_owned(),
+                },
+            },
+        ] {
+            assert_eq!(
+                worker_directive_for_outcome(&stable),
+                WorkerDirective::Complete
+            );
         }
     }
 
