@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "merge-app.toml";
-const DEFAULT_RECONCILE_INTERVAL: &str = "5m";
+const DEFAULT_RECONCILE_INTERVAL: &str = "1h";
 const DEFAULT_WEBHOOK_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 #[derive(Deserialize)]
@@ -96,7 +96,7 @@ pub(crate) async fn load_from(
         bail!("allowed_accounts entries must be greater than zero");
     }
     let reconcile_interval = humantime::parse_duration(&file_config.reconcile_interval)
-        .context("reconcile_interval must be a duration such as `5m` or `30s`")?;
+        .context("reconcile_interval must be a duration such as `1h` or `30s`")?;
     if reconcile_interval.is_zero() {
         bail!("reconcile_interval must be greater than zero");
     }
@@ -160,11 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn config_uses_five_minute_default_and_numeric_account_ids() {
+    fn config_uses_one_hour_default_and_numeric_account_ids() {
         let file_config: FileConfig = toml::from_str("allowed_accounts = [123, 456]").unwrap();
         let interval = humantime::parse_duration(&file_config.reconcile_interval).unwrap();
 
-        assert_eq!(interval, Duration::from_secs(300));
+        assert_eq!(interval, Duration::from_secs(3600));
         assert_eq!(file_config.allowed_accounts, vec![123, 456]);
     }
 
