@@ -72,10 +72,10 @@ struct GraphQlError {
 
 /// Ask GitHub to rebase a pull request using the caller's observed head OID.
 ///
-/// The supplied installation token must have Pull requests: write access. This
-/// function performs one mutation and does not query or retry with a newer head.
-/// A [`RebaseOutcome::StaleHead`] means the caller must recompute repository
-/// state before it attempts another mutation.
+/// The supplied installation token must have Contents: write and Pull
+/// requests: write access. This function performs one mutation and does not
+/// query or retry with a newer head. A [`RebaseOutcome::StaleHead`] means the
+/// caller must recompute repository state before it attempts another mutation.
 pub async fn rebase_pull_request(
     client: &Client,
     installation_token: &str,
