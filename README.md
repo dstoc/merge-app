@@ -2,8 +2,10 @@
 
 `merge-app` is a self-hosted GitHub App for operators who want a serialized
 pull request merge queue. It selects the oldest eligible pull request and, when
-needed, rebases it onto the latest base branch. GitHub remains responsible for
-approvals, required checks, branch rules, auto-merge, and the final merge. See
+needed, rebases it onto the latest base branch. If the rebase reports a confirmed
+content conflict, it can instead merge the current base into the PR working
+branch. GitHub remains responsible for approvals, required checks, branch rules,
+auto-merge, and the final merge. See
 the [proposal](docs/merge-app-proposal.md) for design context.
 
 ## Requirements
@@ -35,7 +37,7 @@ Enable GitHub auto-merge on pull requests. Protect each managed base branch with
 your required review and CI rules. The queue requires branches to be up to date
 before GitHub can merge them. In classic branch protection, enable **Require
 branches to be up to date before merging**. In a ruleset, enable the equivalent
-strict required checks rule. GitHub then runs required checks on the rebased
+strict required checks rule. GitHub then requires checks on the updated
 branch before auto-merge can complete.
 
 ## Build and run
@@ -90,8 +92,26 @@ low-latency queue trigger; they mark an authorized repository for a fresh
 GitHub query. The worker reads current pull request and review state before
 advancing the queue.
 
+Each pass updates one candidate. It tries rebase first, then makes at most one
+merge-update attempt after a confirmed rebase content conflict. It rechecks the
+PR head, target branch and current target tip, auto-merge request, and eligibility
+between attempts. A changed input cancels the fallback. Authentication failures,
+timeouts, stale heads, and unknown or mixed errors never authorize fallback.
+If both methods conflict, the worker leaves the PR and completes the pass. A
+later webhook or reconciliation can revisit it.
+
+A merge-update adds a merge commit to the working branch. The service leaves
+the native auto-merge method unchanged. GitHub enforces the repository's existing
+checks and review rules on the resulting head. Working-branch protection or
+missing access to a fork can prevent an update; the service does not bypass
+those restrictions.
+
 The service retries transient queue states, stale-head races, and GitHub API
-failures for the affected repository. A full reconciliation runs every hour by
+failures for the affected repository. It also recomputes with bounded backoff
+when an accepted branch update has no visible head change yet. GitHub can return the old head in
+an accepted mutation response, so the worker reads the PR again after updates.
+These reads cannot atomically guard the target tip during a mutation; strict
+up-to-date branch protection remains required. A full reconciliation runs every hour by
 default as a safety sweep for missed webhook deliveries, interrupted work, and
 installation or repository access changes. Configure `reconcile_interval` to
 change that interval. The periodic sweep is not the normal queue trigger.

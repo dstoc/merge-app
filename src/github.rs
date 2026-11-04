@@ -79,7 +79,11 @@ pub struct PullRequestState {
     pub mergeability: Mergeability,
     pub merge_state_status: MergeStateStatus,
     pub head_ref_oid: String,
+    /// Current target branch tip from baseRef.target.oid, not cached baseRefOid.
     pub base_ref_oid: String,
+    pub base_ref_name: String,
+    pub head_ref_name: String,
+    pub head_repository_id: Option<String>,
 }
 
 impl PullRequestState {
@@ -393,8 +397,25 @@ struct GraphQlPullRequest {
     mergeable: String,
     merge_state_status: String,
     head_ref_oid: String,
-    base_ref_oid: String,
+    base_ref: Option<GraphQlRef>,
+    base_ref_name: String,
+    head_ref_name: String,
+    head_repository: Option<GraphQlRepository>,
     auto_merge_request: Option<GraphQlAutoMergeRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlRef {
+    target: GraphQlGitObject,
+}
+#[derive(Debug, Deserialize)]
+struct GraphQlGitObject {
+    oid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlRepository {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,6 +433,15 @@ fn decode_pull_request(value: Value) -> Result<PullRequestState> {
         &time::format_description::well_known::Rfc3339,
     )
     .context("GitHub returned an invalid PR creation timestamp")?;
+    let base_ref_oid = pull_request
+        .base_ref
+        .context("GitHub returned no current target ref")?
+        .target
+        .oid;
+    ensure!(
+        !base_ref_oid.is_empty(),
+        "GitHub returned no current target OID"
+    );
     Ok(PullRequestState {
         id: PullRequestId(pull_request.id),
         number: pull_request.number,
@@ -436,7 +466,10 @@ fn decode_pull_request(value: Value) -> Result<PullRequestState> {
         merge_state_status: MergeStateStatus::from_str(&pull_request.merge_state_status)
             .unwrap_or(MergeStateStatus::Unknown),
         head_ref_oid: pull_request.head_ref_oid,
-        base_ref_oid: pull_request.base_ref_oid,
+        base_ref_oid,
+        base_ref_name: pull_request.base_ref_name,
+        head_ref_name: pull_request.head_ref_name,
+        head_repository_id: pull_request.head_repository.map(|repo| repo.id),
     })
 }
 
@@ -551,8 +584,8 @@ async fn ensure_success(response: Response, secret: &str) -> Result<Response> {
     bail!("GitHub GraphQL returned HTTP {status}: {message}");
 }
 
-const PULL_REQUEST_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id number createdAt state isDraft reviewDecision mergeable mergeStateStatus headRefOid baseRefOid autoMergeRequest { enabledAt mergeMethod } } } }";
-const REPOSITORY_QUERY: &str = "query($owner: String!, $repo: String!, $first: Int!, $after: String) { repository(owner: $owner, name: $repo) { id nameWithOwner pullRequests(states: [OPEN], first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) { pageInfo { hasNextPage endCursor } nodes { id number createdAt state isDraft reviewDecision mergeable mergeStateStatus headRefOid baseRefOid autoMergeRequest { enabledAt mergeMethod } } } } }";
+const PULL_REQUEST_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id number createdAt state isDraft reviewDecision mergeable mergeStateStatus headRefOid baseRef { target { oid } } baseRefName headRefName headRepository { id } autoMergeRequest { enabledAt mergeMethod } } } }";
+const REPOSITORY_QUERY: &str = "query($owner: String!, $repo: String!, $first: Int!, $after: String) { repository(owner: $owner, name: $repo) { id nameWithOwner pullRequests(states: [OPEN], first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) { pageInfo { hasNextPage endCursor } nodes { id number createdAt state isDraft reviewDecision mergeable mergeStateStatus headRefOid baseRef { target { oid } } baseRefName headRefName headRepository { id } autoMergeRequest { enabledAt mergeMethod } } } } }";
 
 #[cfg(test)]
 mod tests {
@@ -592,7 +625,11 @@ mod tests {
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "BEHIND",
             "headRefOid": "head-oid",
-            "baseRefOid": "base-oid",
+            "baseRefOid": "cached-old-base-oid",
+            "baseRef": {"target": {"oid": "base-oid"}},
+            "baseRefName": "main",
+            "headRefName": "feature",
+            "headRepository": {"id": "R_kgDOrepo"},
             "autoMergeRequest": {
                 "enabledAt": "2026-10-14T00:01:00Z",
                 "mergeMethod": "SQUASH"
@@ -682,6 +719,12 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("baseRef { target { oid } }")
+        );
         assert!(requests[0]["variables"]["after"].is_null());
         assert_eq!(requests[1]["variables"]["after"], "cursor-1");
         assert!(
@@ -715,12 +758,25 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(pull_request.number, 23);
+        assert_eq!(pull_request.base_ref_name, "main");
+        assert_eq!(pull_request.head_ref_name, "feature");
+        assert_eq!(
+            pull_request.head_repository_id.as_deref(),
+            Some("R_kgDOrepo")
+        );
         assert_eq!(pull_request.state, PullRequestStatus::Open);
         assert_eq!(pull_request.review_decision, ReviewDecision::Approved);
         assert_eq!(pull_request.mergeability, Mergeability::Mergeable);
         assert_eq!(pull_request.base_ref_oid, "base-oid");
         assert_eq!(pull_request.head_ref_oid, "head-oid");
-        assert_eq!(requests.lock().unwrap()[0]["variables"]["number"], 23);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["variables"]["number"], 23);
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("baseRef { target { oid } }")
+        );
     }
 
     #[test]
@@ -827,5 +883,28 @@ mod tests {
             }
         }
         bytes[body_start..body_start + content_length].to_vec()
+    }
+
+    #[test]
+    fn target_guard_requires_the_current_ref_instead_of_cached_base_oid() {
+        assert_eq!(
+            decode_pull_request(sample_pull_request(json!({})))
+                .unwrap()
+                .base_ref_oid,
+            "base-oid"
+        );
+        assert!(decode_pull_request(sample_pull_request(json!({"baseRef": null}))).is_err());
+        assert!(
+            decode_pull_request(sample_pull_request(
+                json!({"baseRef": {"target": {"oid": ""}}})
+            ))
+            .is_err()
+        );
+        assert!(
+            decode_pull_request(sample_pull_request(json!({"headRepository": null})))
+                .unwrap()
+                .head_repository_id
+                .is_none()
+        );
     }
 }

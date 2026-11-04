@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     coordinator::{IntoWorkerDirective, RepositoryWorkCoordinator, RetryReason, WorkerDirective},
     github::RepositoryLocator,
-    pull_request::RebaseOutcome,
+    pull_request::BranchUpdateOutcome,
     queue::{AdvanceOutcome, WaitingReason},
     webhook::{self, LifecycleChange, WebhookState},
 };
@@ -376,13 +376,20 @@ fn worker_directive_for_outcome(outcome: &AdvanceOutcome) -> WorkerDirective {
             reason: WaitingReason::BaseRelationshipUnknown,
             ..
         } => WorkerDirective::Retry(RetryReason::BaseRelationshipUnknown),
-        AdvanceOutcome::RebaseAttempted {
-            outcome: RebaseOutcome::StaleHead { .. },
+        AdvanceOutcome::StateChanged { .. } => {
+            WorkerDirective::Retry(RetryReason::BranchUpdateStateChanged)
+        }
+        AdvanceOutcome::UpdatePending { .. } => {
+            WorkerDirective::Retry(RetryReason::BranchUpdatePending)
+        }
+        AdvanceOutcome::BranchUpdateAttempted {
+            outcome: BranchUpdateOutcome::StaleHead { .. },
             ..
         } => WorkerDirective::Retry(RetryReason::StaleHead),
         AdvanceOutcome::NoActionablePullRequests
         | AdvanceOutcome::AlreadyCurrent { .. }
-        | AdvanceOutcome::RebaseAttempted { .. } => WorkerDirective::Complete,
+        | AdvanceOutcome::BranchUpdated { .. }
+        | AdvanceOutcome::BranchUpdateAttempted { .. } => WorkerDirective::Complete,
     }
 }
 
@@ -608,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_outcomes_retry_only_transient_states_and_stale_heads() {
+    fn queue_outcomes_retry_transient_states_and_leave_confirmed_conflicts() {
         assert_eq!(
             worker_directive_for_outcome(&AdvanceOutcome::Waiting {
                 pull_request_number: 1,
@@ -624,27 +631,45 @@ mod tests {
             WorkerDirective::Retry(RetryReason::BaseRelationshipUnknown)
         );
         assert_eq!(
-            worker_directive_for_outcome(&AdvanceOutcome::RebaseAttempted {
+            worker_directive_for_outcome(&AdvanceOutcome::BranchUpdateAttempted {
                 pull_request_number: 1,
-                outcome: RebaseOutcome::StaleHead {
+                method: crate::pull_request::BranchUpdateMethod::Rebase,
+                outcome: BranchUpdateOutcome::StaleHead {
                     message: "head changed".to_owned(),
                 },
             }),
             WorkerDirective::Retry(RetryReason::StaleHead)
         );
 
+        assert_eq!(
+            worker_directive_for_outcome(&AdvanceOutcome::StateChanged {
+                pull_request_number: 1
+            }),
+            WorkerDirective::Retry(RetryReason::BranchUpdateStateChanged)
+        );
+        assert_eq!(
+            worker_directive_for_outcome(&AdvanceOutcome::UpdatePending {
+                pull_request_number: 1,
+                method: crate::pull_request::BranchUpdateMethod::Merge
+            }),
+            WorkerDirective::Retry(RetryReason::BranchUpdatePending)
+        );
         for stable in [
             AdvanceOutcome::NoActionablePullRequests,
             AdvanceOutcome::AlreadyCurrent {
                 pull_request_number: 1,
             },
-            AdvanceOutcome::RebaseAttempted {
+            AdvanceOutcome::BranchUpdated {
                 pull_request_number: 1,
-                outcome: RebaseOutcome::Rebased,
+                method: crate::pull_request::BranchUpdateMethod::Merge,
+                previous_head_oid: "old-head".to_owned(),
+                head_oid: "new-head".to_owned(),
+                base_oid: "base".to_owned(),
             },
-            AdvanceOutcome::RebaseAttempted {
+            AdvanceOutcome::BranchUpdateAttempted {
                 pull_request_number: 1,
-                outcome: RebaseOutcome::Conflict {
+                method: crate::pull_request::BranchUpdateMethod::Merge,
+                outcome: BranchUpdateOutcome::Conflict {
                     message: "conflict".to_owned(),
                 },
             },

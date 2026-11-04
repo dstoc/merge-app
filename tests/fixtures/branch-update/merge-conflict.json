@@ -1,0 +1,20 @@
+{
+  "data": {
+    "updatePullRequestBranch": null
+  },
+  "errors": [
+    {
+      "type": "UNPROCESSABLE",
+      "path": [
+        "updatePullRequestBranch"
+      ],
+      "locations": [
+        {
+          "line": 1,
+          "column": 51
+        }
+      ],
+      "message": "merge conflict between base and head"
+    }
+  ]
+}

@@ -8,7 +8,7 @@
 
 The app preserves the existing `merge-action` model:
 
-> GitHub owns approvals, required checks, branch protection, auto-merge, and the final merge. `merge-app` only decides which eligible pull request may advance and rebases that pull request onto the latest base branch when required.
+> GitHub owns approvals, required checks, branch protection, auto-merge, and the final merge. `merge-app` only decides which eligible pull request may advance and updates its working branch onto the latest base branch when required. It tries rebase first and permits a merge-update only after a confirmed rebase content conflict.
 
 Repositories participate by installing the GitHub App and enabling auto-merge on pull requests. The public project is the application binary; how an operator deploys, exposes, and supervises it is intentionally outside the initial project scope.
 
@@ -127,7 +127,11 @@ Administration, Actions, or any other permission.
 ### Rebase API validation
 
 The implementation calls GitHub GraphQL's `updatePullRequestBranch` mutation
-with an expected head OID and the `REBASE` update method.
+with an expected head OID and the `REBASE` update method first. As approved in
+merge-app/21, one `MERGE` branch-update fallback is permitted only after a
+confirmed rebase content conflict and fresh input/eligibility checks. This
+updates the working branch; it does not merge the PR into its target or change
+its native auto-merge method.
 
 Live Phase 0 testing established that the App and repository-scoped installation
 token need Contents: write and Pull requests: write. The validator must confirm
@@ -219,7 +223,11 @@ for candidate in candidates:
         return
 
     if candidate is behind:
-        rebase candidate onto base
+        recheck candidate head, target identity/tip, and eligibility
+        request REBASE with expected head
+        if confirmed content conflict and inputs/eligibility remain unchanged:
+            request MERGE with the same expected head
+        recheck resulting head and target
         return
 ```
 
@@ -228,7 +236,7 @@ This intentionally preserves the existing serialized behavior:
 - conflicting PRs are skipped;
 - unresolved mergeability prevents a younger PR from overtaking the candidate;
 - only one queue candidate is updated per pass;
-- after a rebase, normal CI and review policy run again;
+- after a branch update, GitHub applies the existing CI and review policy to the new head;
 - a PR whose required CI fails remains the queue head while it remains eligible;
 - GitHub auto-merge performs the actual merge;
 - a subsequent repository event advances the queue again.
@@ -237,11 +245,36 @@ The service does not poll CI to decide when to merge. GitHub's auto-merge machin
 
 ### Race protection
 
-Every rebase should include the observed head SHA/OID as a compare-and-swap condition.
+Each branch update includes the observed PR head OID as a compare-and-swap
+condition. Before rebase and between methods, compare PR identity, head OID,
+head repository/ref, target ref and current target tip, and auto-merge request.
+Recheck open/non-draft/approved/auto-merge eligibility and mergeability. Read the
+current target tip from `baseRef.target.oid`; `baseRefOid` can retain an older
+OID after the target advances.
 
-If the PR head changes between observation and mutation, the mutation should fail and the repository should simply be recomputed.
+Only captured content-conflict signatures with the expected GraphQL error type
+and mutation path authorize fallback. Unknown, mixed, partial, stale-head, and
+operational failures do not. If both methods conflict on unchanged inputs, leave
+the PR and complete the pass without an immediate retry. Later events and
+reconciliation can revisit it; no exclusion state is stored.
 
-This makes concurrent human activity safe without introducing application-side transactional state.
+Read the PR after an accepted mutation. GitHub can return the old head before the
+update becomes visible. An unchanged head is pending, so recompute with bounded
+backoff rather than treating acceptance as completion or authorizing fallback.
+Changed inputs also require recomputation. A changed head after acceptance is an
+observation, not proof that no other actor pushed concurrently.
+
+GitHub offers no atomic expected-target condition on this mutation. The target
+or PR eligibility can change after the last read. Recheck after updates and
+retain strict up-to-date branch protection so GitHub enforces checks on the
+resulting head before the final merge. The service does not add another checks
+policy or require independent review beyond the repository's existing rules.
+
+This fallback adds working-branch merge commits and up to two mutation calls,
+plus freshness/completion reads, for one candidate per pass. Existing permissions
+remain Contents: write and Pull requests: write. Fork access and working-branch
+protection can still reject updates. The app does not publish a waiter signal
+or change Tines workflows.
 
 ## Concurrency
 
@@ -385,8 +418,9 @@ A local health endpoint may be provided for deployers, but it is not part of the
 ## Security boundary
 
 The App needs Contents: write because GitHub requires it for a server-side PR
-branch rebase. This permission is broader than the rebase mutation. The service
-uses it only when it calls `updatePullRequestBranch` with `REBASE`; the service
+branch update. This permission is broader than the branch-update mutation. The
+service uses it only when it calls `updatePullRequestBranch` with `REBASE` or the
+bounded `MERGE` fallback; the service
 does not call repository content write APIs or merge pull requests.
 
 The intended credential may:
@@ -512,7 +546,7 @@ serialize by repository
       ↓
 reconstruct queue from GitHub
       ↓
-rebase at most one PR
+update at most one PR (REBASE, then guarded conflict-only MERGE fallback)
       ↓
 GitHub CI / reviews / auto-merge
 ```

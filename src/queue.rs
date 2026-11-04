@@ -11,11 +11,18 @@ use crate::{
         BaseRelationship, GitHubQueries, MergeStateStatus, Mergeability, PullRequestId,
         PullRequestState, PullRequestStatus, RepositoryLocator, RepositoryState, ReviewDecision,
     },
-    pull_request::{RebaseOutcome, rebase_pull_request},
+    pull_request::{BranchUpdateMethod, BranchUpdateOutcome, update_pull_request_branch},
 };
 
 /// The read interface used to obtain the current repository queue snapshot.
 pub trait QueueQueries {
+    fn pull_request_state<'a>(
+        &'a self,
+        repository: &'a RepositoryLocator,
+        number: u64,
+        credentials: &'a InstallationCredentials,
+    ) -> impl Future<Output = Result<PullRequestState>> + Send + 'a;
+
     fn repository_state<'a>(
         &'a self,
         repository: &'a RepositoryLocator,
@@ -24,6 +31,15 @@ pub trait QueueQueries {
 }
 
 impl QueueQueries for GitHubQueries {
+    fn pull_request_state<'a>(
+        &'a self,
+        repository: &'a RepositoryLocator,
+        number: u64,
+        credentials: &'a InstallationCredentials,
+    ) -> impl Future<Output = Result<PullRequestState>> + Send + 'a {
+        async move { GitHubQueries::pull_request_state(self, repository, number, credentials).await }
+    }
+
     fn repository_state<'a>(
         &'a self,
         repository: &'a RepositoryLocator,
@@ -33,14 +49,15 @@ impl QueueQueries for GitHubQueries {
     }
 }
 
-/// The mutation interface used to rebase the selected PR.
+/// The mutation interface used to update the selected PR working branch.
 pub trait QueueMutations {
-    fn rebase<'a>(
+    fn update_branch<'a>(
         &'a self,
         credentials: &'a InstallationCredentials,
         pull_request_id: &'a PullRequestId,
         expected_head_oid: &'a str,
-    ) -> impl Future<Output = Result<RebaseOutcome>> + Send + 'a;
+        method: BranchUpdateMethod,
+    ) -> impl Future<Output = Result<BranchUpdateOutcome>> + Send + 'a;
 }
 
 /// GitHub's implementation of the queue mutation interface.
@@ -56,18 +73,20 @@ impl GitHubQueueMutations {
 }
 
 impl QueueMutations for GitHubQueueMutations {
-    fn rebase<'a>(
+    fn update_branch<'a>(
         &'a self,
         credentials: &'a InstallationCredentials,
         pull_request_id: &'a PullRequestId,
         expected_head_oid: &'a str,
-    ) -> impl Future<Output = Result<RebaseOutcome>> + Send + 'a {
+        method: BranchUpdateMethod,
+    ) -> impl Future<Output = Result<BranchUpdateOutcome>> + Send + 'a {
         async move {
-            rebase_pull_request(
+            update_pull_request_branch(
                 &self.client,
                 &credentials.token,
                 pull_request_id.as_str(),
                 expected_head_oid,
+                method,
             )
             .await
             .map_err(anyhow::Error::from)
@@ -111,9 +130,27 @@ pub enum AdvanceOutcome {
     AlreadyCurrent {
         pull_request_number: u64,
     },
-    RebaseAttempted {
+    BranchUpdateAttempted {
         pull_request_number: u64,
-        outcome: RebaseOutcome,
+        method: BranchUpdateMethod,
+        outcome: BranchUpdateOutcome,
+    },
+    /// Inputs changed or eligibility was lost; recompute without carrying a conflict forward.
+    StateChanged {
+        pull_request_number: u64,
+    },
+    /// An accepted update has not yet produced a visible head change.
+    UpdatePending {
+        pull_request_number: u64,
+        method: BranchUpdateMethod,
+    },
+    /// A fresh read observed a changed head after acceptance; another actor may have pushed.
+    BranchUpdated {
+        pull_request_number: u64,
+        method: BranchUpdateMethod,
+        previous_head_oid: String,
+        head_oid: String,
+        base_oid: String,
     },
 }
 
@@ -173,7 +210,7 @@ pub fn decide_advance(state: &RepositoryState) -> Result<AdvanceDecision> {
     Ok(AdvanceDecision::NoActionablePullRequests)
 }
 
-/// Query current repository state and perform at most one queue mutation.
+/// Update one candidate: rebase first, then merge-update only after a confirmed conflict.
 ///
 /// This function never merges pull requests, polls for CI, or creates reviews.
 pub async fn advance<Q, M>(
@@ -210,16 +247,128 @@ where
             pull_request_id,
             expected_head_oid,
         } => {
-            let outcome = mutations
-                .rebase(credentials, &pull_request_id, &expected_head_oid)
+            let observed = state
+                .pull_requests
+                .iter()
+                .find(|pr| pr.id == pull_request_id)
+                .context("selected PR missing from queue snapshot")?;
+            let mut fresh = queries
+                .pull_request_state(repository, pull_request_number, credentials)
                 .await
-                .with_context(|| format!("failed to rebase PR #{pull_request_number}"))?;
-            Ok(AdvanceOutcome::RebaseAttempted {
-                pull_request_number,
-                outcome,
-            })
+                .context("failed to recheck PR before branch update")?;
+            if !same_update_inputs(observed, &fresh) || !can_update(&fresh) {
+                return Ok(AdvanceOutcome::StateChanged {
+                    pull_request_number,
+                });
+            }
+            for method in [BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge] {
+                let outcome = mutations
+                    .update_branch(credentials, &pull_request_id, &expected_head_oid, method)
+                    .await
+                    .with_context(|| {
+                        format!("failed to update PR #{pull_request_number} using {method:?}")
+                    })?;
+                if matches!(outcome, BranchUpdateOutcome::StaleHead { .. }) {
+                    return Ok(AdvanceOutcome::BranchUpdateAttempted {
+                        pull_request_number,
+                        method,
+                        outcome,
+                    });
+                }
+                let after = queries
+                    .pull_request_state(repository, pull_request_number, credentials)
+                    .await
+                    .context("failed to recheck PR after branch update")?;
+                match outcome {
+                    BranchUpdateOutcome::Accepted { .. } => {
+                        // GitHub may return the OLD head in an accepted mutation payload.
+                        // Only a fresh read can establish visible completion. We never
+                        // reuse approval/check state from the pre-update head.
+                        if !same_branch_identity(&fresh, &after)
+                            || after.head_ref_oid.is_empty()
+                            || fresh.base_ref_oid != after.base_ref_oid
+                        {
+                            return Ok(AdvanceOutcome::StateChanged {
+                                pull_request_number,
+                            });
+                        }
+                        if after.head_ref_oid == expected_head_oid {
+                            return Ok(AdvanceOutcome::UpdatePending {
+                                pull_request_number,
+                                method,
+                            });
+                        }
+                        return Ok(AdvanceOutcome::BranchUpdated {
+                            pull_request_number,
+                            method,
+                            previous_head_oid: expected_head_oid,
+                            head_oid: after.head_ref_oid,
+                            base_oid: after.base_ref_oid,
+                        });
+                    }
+                    BranchUpdateOutcome::Conflict { .. } => {
+                        tracing::info!(event = "branch_update_conflict",
+                            installation_id = repository.installation_id,
+                            repository = %format!("{}/{}", repository.owner, repository.name),
+                            pull_request_number,
+                            ?method, head_oid = %expected_head_oid, base_oid = %fresh.base_ref_oid,
+                            base_ref = %fresh.base_ref_name, message = ?outcome);
+                        if !same_update_inputs(&fresh, &after) {
+                            return Ok(AdvanceOutcome::StateChanged {
+                                pull_request_number,
+                            });
+                        }
+                        if method == BranchUpdateMethod::Merge {
+                            // Both methods conflicted. Leave the branch; no immediate retry.
+                            return Ok(AdvanceOutcome::BranchUpdateAttempted {
+                                pull_request_number,
+                                method,
+                                outcome,
+                            });
+                        }
+                        if !can_update(&after) {
+                            return Ok(AdvanceOutcome::StateChanged {
+                                pull_request_number,
+                            });
+                        }
+                        fresh = after;
+                    }
+                    BranchUpdateOutcome::StaleHead { .. } => unreachable!(),
+                }
+            }
+            unreachable!("the merge attempt always returns")
         }
     }
+}
+
+// The query is scoped to the same target repository. Names detect retargets
+// even when two branches point at the same commit. A deleted head repo fails closed.
+fn same_branch_identity(before: &PullRequestState, after: &PullRequestState) -> bool {
+    before.id == after.id
+        && before.base_ref_name == after.base_ref_name
+        && before.head_ref_name == after.head_ref_name
+        && before
+            .head_repository_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
+        && before.head_repository_id == after.head_repository_id
+}
+
+fn same_update_inputs(before: &PullRequestState, after: &PullRequestState) -> bool {
+    same_branch_identity(before, after)
+        && before.head_ref_oid == after.head_ref_oid
+        && before.base_ref_oid == after.base_ref_oid
+        && before.auto_merge_request == after.auto_merge_request
+}
+
+fn can_update(pr: &PullRequestState) -> bool {
+    is_candidate(pr)
+        && pr.mergeability == Mergeability::Mergeable
+        && pr.base_relationship() == BaseRelationship::Behind
+        && !pr.head_ref_oid.is_empty()
+        && !pr.base_ref_oid.is_empty()
+        && !pr.head_ref_name.is_empty()
+        && !pr.base_ref_name.is_empty()
 }
 
 fn is_candidate(pull_request: &PullRequestState) -> bool {
@@ -231,7 +380,7 @@ fn is_candidate(pull_request: &PullRequestState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::github::{AutoMergeRequest, MergeMethod, RepositoryIdentity};
@@ -252,6 +401,9 @@ mod tests {
             merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: format!("head_{number}"),
             base_ref_oid: format!("base_{number}"),
+            base_ref_name: "main".to_owned(),
+            head_ref_name: format!("feature-{number}"),
+            head_repository_id: Some("repo_node".to_owned()),
         }
     }
 
@@ -396,76 +548,343 @@ mod tests {
         );
     }
 
-    struct MockQueries(RepositoryState);
+    struct ScriptQueries {
+        reads: Mutex<std::collections::VecDeque<Result<PullRequestState>>>,
+    }
 
-    impl QueueQueries for MockQueries {
-        fn repository_state<'a>(
-            &'a self,
-            _repository: &'a RepositoryLocator,
-            _credentials: &'a InstallationCredentials,
-        ) -> impl Future<Output = Result<RepositoryState>> + Send + 'a {
-            async move { Ok(self.0.clone()) }
+    impl QueueQueries for ScriptQueries {
+        async fn repository_state(
+            &self,
+            _: &RepositoryLocator,
+            _: &InstallationCredentials,
+        ) -> Result<RepositoryState> {
+            Ok(repository_state(vec![fixture()]))
+        }
+        async fn pull_request_state(
+            &self,
+            _: &RepositoryLocator,
+            number: u64,
+            _: &InstallationCredentials,
+        ) -> Result<PullRequestState> {
+            assert_eq!(number, 1);
+            self.reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected PR read")
         }
     }
 
-    struct MockMutations {
-        calls: Mutex<Vec<(String, String)>>,
-        outcome: RebaseOutcome,
+    type UpdateCall = (BranchUpdateMethod, String, String);
+    struct ScriptMutations {
+        outcomes: Mutex<std::collections::VecDeque<Result<BranchUpdateOutcome>>>,
+        calls: Mutex<Vec<UpdateCall>>,
     }
 
-    impl QueueMutations for MockMutations {
-        fn rebase<'a>(
-            &'a self,
-            _credentials: &'a InstallationCredentials,
-            pull_request_id: &'a PullRequestId,
-            expected_head_oid: &'a str,
-        ) -> impl Future<Output = Result<RebaseOutcome>> + Send + 'a {
-            async move {
-                self.calls.lock().unwrap().push((
-                    pull_request_id.as_str().to_owned(),
-                    expected_head_oid.to_owned(),
-                ));
-                Ok(self.outcome.clone())
+    impl QueueMutations for ScriptMutations {
+        async fn update_branch(
+            &self,
+            _: &InstallationCredentials,
+            id: &PullRequestId,
+            head: &str,
+            method: BranchUpdateMethod,
+        ) -> Result<BranchUpdateOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method, id.as_str().to_owned(), head.to_owned()));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected branch update")
+        }
+    }
+
+    fn fixture() -> PullRequestState {
+        pull_request(1, "2026-10-14T00:00:00Z")
+    }
+    fn conflict() -> Result<BranchUpdateOutcome> {
+        Ok(BranchUpdateOutcome::Conflict {
+            message: "confirmed content conflict".to_owned(),
+        })
+    }
+    fn accepted() -> Result<BranchUpdateOutcome> {
+        Ok(BranchUpdateOutcome::Accepted {
+            head_oid: "head_1".to_owned(),
+        })
+    }
+    fn updated() -> PullRequestState {
+        let mut pr = fixture();
+        pr.head_ref_oid = "updated-head".to_owned();
+        pr.review_decision = ReviewDecision::ReviewRequired;
+        pr.merge_state_status = MergeStateStatus::Unknown;
+        pr
+    }
+
+    async fn run_script(
+        reads: Vec<Result<PullRequestState>>,
+        outcomes: Vec<Result<BranchUpdateOutcome>>,
+    ) -> (Result<AdvanceOutcome>, Vec<UpdateCall>) {
+        let queries = ScriptQueries {
+            reads: Mutex::new(reads.into()),
+        };
+        let mutations = ScriptMutations {
+            calls: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(outcomes.into()),
+        };
+        let repository = RepositoryLocator::new(1, "owner", "repo").unwrap();
+        let credentials = InstallationCredentials {
+            installation_id: 1,
+            token: "token".to_owned(),
+            expires_at: "unused".to_owned(),
+            permissions: Default::default(),
+        };
+        let result = advance(&repository, &credentials, &queries, &mutations).await;
+        assert!(queries.reads.lock().unwrap().is_empty(), "unused PR reads");
+        assert!(
+            mutations.outcomes.lock().unwrap().is_empty(),
+            "unused mutation outcomes"
+        );
+        let calls = mutations.calls.into_inner().unwrap();
+        (result, calls)
+    }
+
+    fn assert_methods(calls: Vec<UpdateCall>, methods: &[BranchUpdateMethod]) {
+        assert_eq!(
+            calls,
+            methods
+                .iter()
+                .map(|method| (*method, "PR_node_1".to_owned(), "head_1".to_owned()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_rebase_conflict_then_merge_updates_only_the_selected_working_branch() {
+        let (outcome, calls) = run_script(
+            vec![Ok(fixture()), Ok(fixture()), Ok(updated())],
+            vec![conflict(), accepted()],
+        )
+        .await;
+        assert_eq!(
+            outcome.unwrap(),
+            AdvanceOutcome::BranchUpdated {
+                pull_request_number: 1,
+                method: BranchUpdateMethod::Merge,
+                previous_head_oid: "head_1".to_owned(),
+                head_oid: "updated-head".to_owned(),
+                base_oid: "base_1".to_owned(),
+            }
+        );
+        assert_methods(
+            calls,
+            &[BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge],
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_rebase_never_falls_back_and_uses_a_fresh_head_read() {
+        let (outcome, calls) =
+            run_script(vec![Ok(fixture()), Ok(updated())], vec![accepted()]).await;
+        assert!(
+            matches!(outcome.unwrap(), AdvanceOutcome::BranchUpdated { method: BranchUpdateMethod::Rebase, head_oid, .. } if head_oid == "updated-head")
+        );
+        assert_methods(calls, &[BranchUpdateMethod::Rebase]);
+    }
+
+    #[tokio::test]
+    async fn accepted_updates_with_no_visible_head_change_are_pending_for_either_method() {
+        for method in [BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge] {
+            let mut reads = vec![Ok(fixture()), Ok(fixture())];
+            let mut outcomes = vec![accepted()];
+            let methods = if method == BranchUpdateMethod::Merge {
+                reads.push(Ok(fixture()));
+                outcomes.insert(0, conflict());
+                vec![BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge]
+            } else {
+                vec![BranchUpdateMethod::Rebase]
+            };
+            let (outcome, calls) = run_script(reads, outcomes).await;
+            assert_eq!(
+                outcome.unwrap(),
+                AdvanceOutcome::UpdatePending {
+                    pull_request_number: 1,
+                    method
+                }
+            );
+            assert_methods(calls, &methods);
+        }
+    }
+
+    #[tokio::test]
+    async fn two_confirmed_conflicts_leave_the_pr_without_another_mutation() {
+        let (outcome, calls) = run_script(
+            vec![Ok(fixture()), Ok(fixture()), Ok(fixture())],
+            vec![conflict(), conflict()],
+        )
+        .await;
+        assert!(matches!(
+            outcome.unwrap(),
+            AdvanceOutcome::BranchUpdateAttempted {
+                method: BranchUpdateMethod::Merge,
+                outcome: BranchUpdateOutcome::Conflict { .. },
+                ..
+            }
+        ));
+        assert_methods(
+            calls,
+            &[BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge],
+        );
+    }
+
+    fn invalidated_snapshots() -> Vec<PullRequestState> {
+        let changes: Vec<fn(&mut PullRequestState)> = vec![
+            |pr| pr.head_ref_oid = "pushed-head".to_owned(),
+            |pr| pr.base_ref_oid = "advanced-base".to_owned(),
+            |pr| pr.base_ref_name = "retargeted-same-oid".to_owned(),
+            |pr| pr.head_ref_name = "renamed-head".to_owned(),
+            |pr| pr.head_repository_id = Some("different-fork".to_owned()),
+            |pr| pr.head_repository_id = None,
+            |pr| pr.id = PullRequestId("different-pr".to_owned()),
+            |pr| pr.auto_merge_request = None,
+            |pr| pr.auto_merge_request.as_mut().unwrap().enabled_at = "reenabled".to_owned(),
+            |pr| pr.review_decision = ReviewDecision::ChangesRequested,
+            |pr| pr.review_decision = ReviewDecision::Unknown,
+            |pr| pr.is_draft = true,
+            |pr| pr.state = PullRequestStatus::Closed,
+            |pr| pr.state = PullRequestStatus::Merged,
+            |pr| pr.mergeability = Mergeability::Unknown,
+            |pr| pr.mergeability = Mergeability::Conflicting,
+            |pr| pr.merge_state_status = MergeStateStatus::Clean,
+            |pr| pr.merge_state_status = MergeStateStatus::Conflicting,
+            |pr| pr.merge_state_status = MergeStateStatus::Unknown,
+        ];
+        changes
+            .into_iter()
+            .map(|change| {
+                let mut pr = fixture();
+                change(&mut pr);
+                pr
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn changes_before_rebase_or_between_methods_require_recomputation() {
+        for changed in invalidated_snapshots() {
+            let (outcome, calls) = run_script(vec![Ok(changed.clone())], vec![]).await;
+            assert_eq!(
+                outcome.unwrap(),
+                AdvanceOutcome::StateChanged {
+                    pull_request_number: 1
+                }
+            );
+            assert!(calls.is_empty());
+            let (outcome, calls) =
+                run_script(vec![Ok(fixture()), Ok(changed)], vec![conflict()]).await;
+            assert_eq!(
+                outcome.unwrap(),
+                AdvanceOutcome::StateChanged {
+                    pull_request_number: 1
+                }
+            );
+            assert_methods(calls, &[BranchUpdateMethod::Rebase]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_race_during_either_update_recomputes_without_further_mutation() {
+        for method in [BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge] {
+            for accepted_result in [false, true] {
+                let mut changed = if accepted_result {
+                    updated()
+                } else {
+                    fixture()
+                };
+                changed.base_ref_oid = "new-target".to_owned();
+                let mut reads = vec![Ok(fixture())];
+                let mut outcomes = Vec::new();
+                let mut methods = vec![BranchUpdateMethod::Rebase];
+                if method == BranchUpdateMethod::Merge {
+                    reads.push(Ok(fixture()));
+                    outcomes.push(conflict());
+                    methods.push(BranchUpdateMethod::Merge);
+                }
+                reads.push(Ok(changed));
+                outcomes.push(if accepted_result {
+                    accepted()
+                } else {
+                    conflict()
+                });
+                let (outcome, calls) = run_script(reads, outcomes).await;
+                assert_eq!(
+                    outcome.unwrap(),
+                    AdvanceOutcome::StateChanged {
+                        pull_request_number: 1
+                    }
+                );
+                assert_methods(calls, &methods);
             }
         }
     }
 
     #[tokio::test]
-    async fn advance_makes_exactly_one_rebase_attempt_with_the_observed_head() {
-        let queries = MockQueries(repository_state(vec![pull_request(
-            1,
-            "2026-10-14T00:00:00Z",
-        )]));
-        let mutations = MockMutations {
-            calls: Mutex::new(Vec::new()),
-            outcome: RebaseOutcome::StaleHead {
-                message: "head changed".to_owned(),
-            },
-        };
-        let repository = RepositoryLocator::new(1, "owner", "repo").unwrap();
-        let credentials = InstallationCredentials {
-            installation_id: 1,
-            token: "test-token".to_owned(),
-            expires_at: "2026-10-14T01:00:00Z".to_owned(),
-            permissions: BTreeMap::new(),
-        };
-
-        let outcome = advance(&repository, &credentials, &queries, &mutations)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            AdvanceOutcome::RebaseAttempted {
-                pull_request_number: 1,
-                outcome: RebaseOutcome::StaleHead {
-                    message: "head changed".to_owned(),
-                },
+    async fn stale_and_operational_failures_never_authorize_the_next_method() {
+        for method in [BranchUpdateMethod::Rebase, BranchUpdateMethod::Merge] {
+            for stale in [false, true] {
+                let mut reads = vec![Ok(fixture())];
+                let mut outcomes = Vec::new();
+                let mut methods = vec![BranchUpdateMethod::Rebase];
+                if method == BranchUpdateMethod::Merge {
+                    reads.push(Ok(fixture()));
+                    outcomes.push(conflict());
+                    methods.push(BranchUpdateMethod::Merge);
+                }
+                outcomes.push(if stale {
+                    Ok(BranchUpdateOutcome::StaleHead {
+                        message: "head mismatch".to_owned(),
+                    })
+                } else {
+                    Err(anyhow::anyhow!("uncertain/operational request failure"))
+                });
+                let (outcome, calls) = run_script(reads, outcomes).await;
+                if stale {
+                    assert!(matches!(
+                        outcome.unwrap(),
+                        AdvanceOutcome::BranchUpdateAttempted {
+                            outcome: BranchUpdateOutcome::StaleHead { .. },
+                            ..
+                        }
+                    ));
+                } else {
+                    assert!(outcome.is_err());
+                }
+                assert_methods(calls, &methods);
             }
-        );
-        assert_eq!(
-            *mutations.calls.lock().unwrap(),
-            vec![("PR_node_1".to_owned(), "head_1".to_owned())]
-        );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_freshness_or_completion_reads_stop_further_mutation() {
+        for stage in 0..3 {
+            let mut reads = vec![];
+            let mut outcomes = vec![];
+            let mut methods = vec![];
+            if stage > 0 {
+                reads.push(Ok(fixture()));
+                outcomes.push(conflict());
+                methods.push(BranchUpdateMethod::Rebase);
+            }
+            if stage > 1 {
+                reads.push(Ok(fixture()));
+                outcomes.push(accepted());
+                methods.push(BranchUpdateMethod::Merge);
+            }
+            reads.push(Err(anyhow::anyhow!("GitHub read failed")));
+            let (outcome, calls) = run_script(reads, outcomes).await;
+            assert!(outcome.is_err());
+            assert_methods(calls, &methods);
+        }
     }
 }

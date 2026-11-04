@@ -91,6 +91,8 @@ pub enum RetryReason {
     MergeabilityUnknown,
     BaseRelationshipUnknown,
     StaleHead,
+    BranchUpdatePending,
+    BranchUpdateStateChanged,
     GitHubApiFailure,
 }
 
@@ -503,7 +505,10 @@ fn schedule_retry<F, Fut>(
         let current_backoff = state.retry_backoff.get(&key).copied().unwrap_or_default();
         let mut next_backoff = current_backoff;
         let (delay, stage) = match reason {
-            RetryReason::MergeabilityUnknown | RetryReason::BaseRelationshipUnknown => {
+            RetryReason::MergeabilityUnknown
+            | RetryReason::BaseRelationshipUnknown
+            | RetryReason::BranchUpdatePending
+            | RetryReason::BranchUpdateStateChanged => {
                 next_backoff.queue_state_stage =
                     next_backoff.queue_state_stage.saturating_add(1).min(3);
                 (
@@ -952,6 +957,8 @@ mod tests {
                     Ok::<_, anyhow::Error>(match call {
                         1 => WorkerDirective::Retry(RetryReason::MergeabilityUnknown),
                         2 => WorkerDirective::Retry(RetryReason::BaseRelationshipUnknown),
+                        3 => WorkerDirective::Retry(RetryReason::BranchUpdatePending),
+                        4 => WorkerDirective::Retry(RetryReason::BranchUpdateStateChanged),
                         _ => WorkerDirective::Complete,
                     })
                 }
@@ -978,6 +985,16 @@ mod tests {
         assert_eq!(pending.deadline - Instant::now(), Duration::from_secs(15));
         tokio::time::advance(Duration::from_secs(15)).await;
         assert_eq!(wait_for_call(&mut call_rx).await, 3);
+        let pending = wait_for_pending_retry(&coordinator, &repository).await;
+        assert_eq!(pending.reason, RetryReason::BranchUpdatePending);
+        assert_eq!(pending.deadline - Instant::now(), Duration::from_secs(30));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(wait_for_call(&mut call_rx).await, 4);
+        let pending = wait_for_pending_retry(&coordinator, &repository).await;
+        assert_eq!(pending.reason, RetryReason::BranchUpdateStateChanged);
+        assert_eq!(pending.deadline - Instant::now(), Duration::from_secs(30));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(wait_for_call(&mut call_rx).await, 5);
         assert!(
             coordinator
                 .inner
