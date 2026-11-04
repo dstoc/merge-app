@@ -596,6 +596,9 @@ mod tests {
             merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: "head-before".to_owned(),
             base_ref_oid: "base".to_owned(),
+            base_ref_name: "main".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            head_repository_id: Some("R_test".to_owned()),
             auto_merge_request: Some(merge_app::github::AutoMergeRequest {
                 enabled_at: "2026-10-14T00:00:00Z".to_owned(),
                 merge_method: MergeMethod::Squash,
@@ -619,6 +622,9 @@ mod tests {
             merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: "head-before".to_owned(),
             base_ref_oid: "base".to_owned(),
+            base_ref_name: "main".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            head_repository_id: Some("R_test".to_owned()),
             auto_merge_request: Some(merge_app::github::AutoMergeRequest {
                 enabled_at: "2026-10-14T00:00:00Z".to_owned(),
                 merge_method: MergeMethod::Squash,

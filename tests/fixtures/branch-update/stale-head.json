@@ -1,0 +1,1 @@
+{"data":{"updatePullRequestBranch":null},"errors":[{"type":"UNPROCESSABLE","path":["updatePullRequestBranch"],"locations":[{"line":1,"column":51}],"message":"head sha didn't match the current head ref."}]}

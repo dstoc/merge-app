@@ -21,7 +21,7 @@ use merge_app::{
         PullRequestState, PullRequestStatus, RepositoryIdentity, RepositoryLocator,
         RepositoryState, ReviewDecision,
     },
-    pull_request::RebaseOutcome,
+    pull_request::{BranchUpdateMethod, BranchUpdateOutcome},
     queue::{self, AdvanceOutcome, QueueMutations, QueueQueries},
     webhook::{self, LifecycleChange, WebhookState},
 };
@@ -57,6 +57,20 @@ struct QueryCall {
 }
 
 impl QueueQueries for MockGitHubQueries {
+    async fn pull_request_state(
+        &self,
+        _repository: &RepositoryLocator,
+        number: u64,
+        _credentials: &InstallationCredentials,
+    ) -> anyhow::Result<PullRequestState> {
+        Ok(self
+            .state
+            .pull_requests
+            .iter()
+            .find(|pr| pr.number == number)
+            .unwrap()
+            .clone())
+    }
     fn repository_state<'a>(
         &'a self,
         repository: &'a RepositoryLocator,
@@ -104,20 +118,24 @@ struct MutationCall {
 }
 
 impl QueueMutations for MockGitHubMutations {
-    fn rebase<'a>(
+    fn update_branch<'a>(
         &'a self,
         credentials: &'a InstallationCredentials,
         pull_request_id: &'a PullRequestId,
         expected_head_oid: &'a str,
-    ) -> impl Future<Output = anyhow::Result<RebaseOutcome>> + Send + 'a {
+        method: BranchUpdateMethod,
+    ) -> impl Future<Output = anyhow::Result<BranchUpdateOutcome>> + Send + 'a {
         async move {
+            assert_eq!(method, BranchUpdateMethod::Rebase);
             self.calls.lock().unwrap().push(MutationCall {
                 installation_id: credentials.installation_id,
                 token: credentials.token.clone(),
                 pull_request_id: pull_request_id.as_str().to_owned(),
                 expected_head_oid: expected_head_oid.to_owned(),
             });
-            Ok(RebaseOutcome::Rebased)
+            Ok(BranchUpdateOutcome::Accepted {
+                head_oid: "head-42".to_owned(),
+            })
         }
     }
 }
@@ -446,9 +464,9 @@ async fn verified_webhooks_drive_serialized_queue_work_and_lifecycle_guards() {
     assert_eq!(completed_repository, repository);
     assert!(matches!(
         outcome,
-        AdvanceOutcome::RebaseAttempted {
+        AdvanceOutcome::UpdatePending {
             pull_request_number: 42,
-            outcome: RebaseOutcome::Rebased,
+            method: BranchUpdateMethod::Rebase,
         }
     ));
 
@@ -509,6 +527,9 @@ fn queue_state() -> RepositoryState {
             merge_state_status: MergeStateStatus::Behind,
             head_ref_oid: "head-42".to_owned(),
             base_ref_oid: "base-42".to_owned(),
+            base_ref_name: "main".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            head_repository_id: Some("R_repository".to_owned()),
         }],
     }
 }
